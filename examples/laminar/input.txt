@@ -1,0 +1,16 @@
+! Laminar Poiseuille flow with constant flow rate: -dp/dx must be 3/Re, divergence at round-off.
+nx = 16
+ny = 33
+nz = 16
+lx = 6.283185307179586
+lz = 3.141592653589793
+fd_order = 6
+grid_alpha = 2.5
+re = 1000
+forcing = cfr
+ubulk = 1
+init_type = laminar
+init_amp = 0.01
+nstep = 200
+iout_log = 100
+cfl = 1.0

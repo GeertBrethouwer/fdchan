@@ -1,0 +1,29 @@
+! Tollmien-Schlichting wave, Re = 5000 (centreline), alpha = 1.12 (Lenaers et al. 2014 Sec. 5.1, HiCHAN examples/ts_wave).
+! Run, then: python3 fit.py data/log.dat 250   (expected with these settings: absolute error 3.4e-7)
+nx = 4
+ny = 65
+nz = 1
+lx = 5.609986881410345
+lz = 1.0
+grid_type = tanh
+grid_alpha = 4.0
+fd_order = 6
+y_scheme = compact
+y_closure = hichan
+nl_form = advective
+re = 5000
+forcing = cfr
+ubulk = 0.6666666666666667
+fixed_dt = 1
+dt = 0.002
+cfl_visc = 2.0
+dt_max = 0.01
+tmax = 350
+nstep = 100000000
+init_type = mode
+init_amp = 1e-6
+mode_kx = 1
+mode_log_kx = 1
+iout_log = 200
+nthreads = 1
+data_dir = data

@@ -1,0 +1,26 @@
+! Coarse turbulent channel, Re_b = 2800: transition from noise and a stability check (DESIGN.md sec. 6),
+! not a resolved DNS.
+nx = 32
+ny = 65
+nz = 48
+lx = 6.283185307179586
+lz = 3.141592653589793
+grid_type = tanh
+grid_alpha = 3.0
+fd_order = 6
+re = 2800
+forcing = cfr
+ubulk = 1.0
+cfl = 1.2
+dt_max = 0.05
+init_type = noise
+init_amp = 0.15
+tmax = 200
+nstep = 1000000
+iout_log = 200
+iout_stats = 20
+tstats_start = 120
+iout_save_stats = 2000
+iout_restart = 1000
+timing = 1
+y_scheme = compact
