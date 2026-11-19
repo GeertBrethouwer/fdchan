@@ -177,6 +177,7 @@ class Solver {
     nu = 1.0 / P.re;
     hz = P.lz / nzg;
     if (P.nl_form != "rotational" && P.nl_form != "advective") fatal("FDCHAN: nl_form must be rotational or advective");
+    if (P.rk_stages != 3 && P.rk_stages != 4) fatal("FDCHAN: rk_stages must be 3 or 4");
     setup_operators();
     for (int c = 0; c < (P.nl_form == "advective" ? 9 : 6); ++c) Pb[c].alloc(npad);
     u.alloc(nsp); v.alloc(nsp); w.alloc(nsp);
@@ -416,11 +417,19 @@ class Solver {
 
   // ---------------------------------------------------------------- RK3 step
   void advance() {
-    static const double gam[3] = {8.0 / 15, 5.0 / 12, 3.0 / 4};
-    static const double zet[3] = {0.0, -17.0 / 60, -5.0 / 12};
+    // u^s = u^{s-1} + dt (gam_s H^{s-1} + zet_s H^{s-2}) - (gam_s + zet_s) dt grad p
+    // 3 stages: Wray's RK3 (|lambda dt| < sqrt(3) on the imaginary axis, 2.51 on the real axis);
+    // 4 stages: SIMSON user guide (Chevalier et al. 2007), Table 5.1, also 3rd order (sqrt(8), 2.79)
+    static const double gam3[3] = {8.0 / 15, 5.0 / 12, 3.0 / 4};
+    static const double zet3[3] = {0.0, -17.0 / 60, -5.0 / 12};
+    static const double gam4[4] = {8.0 / 17, 17.0 / 60, 5.0 / 12, 3.0 / 4};
+    static const double zet4[4] = {0.0, -15.0 / 68, -17.0 / 60, -5.0 / 12};
+    const int ns = P.rk_stages;
+    const double* gam = ns == 4 ? gam4 : gam3;
+    const double* zet = ns == 4 ? zet4 : zet3;
     dpdx_step = 0;
     if (P.forcing == "cfr") reset_dpdx_accumulator();
-    for (int s = 0; s < 3; ++s) {
+    for (int s = 0; s < ns; ++s) {
       auto t0 = tick();
       nonlinear();
       if (s == 0) choose_dt();

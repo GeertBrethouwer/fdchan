@@ -12,7 +12,8 @@ and z) with
   round-off at every grid point, walls included. One z-FFT and, per (kx, ±kz) pair, one banded LU solve for φ
   and D1 φ together; no influence matrix (see [DESIGN.md](DESIGN.md));
 * **nonlinear terms:** rotational form u × ω (9 x-transforms per stage) or advective form (15);
-* **time:** low-storage RK3 (γ = 8/15, 5/12, 3/4; ζ = 0, −17/60, −5/12), explicit viscous terms, adaptive Δt
+* **time:** low-storage RK3 (γ = 8/15, 5/12, 3/4; ζ = 0, −17/60, −5/12), or the 4-stage RK3 of SIMSON
+  (`rk_stages = 4`: γ = 8/17, 17/60, 5/12, 3/4; ζ = 0, −15/68, −17/60, −5/12), explicit viscous terms, adaptive Δt
   from the advective and viscous limits;
 * **forcing:** constant flow rate (`cfr`, exact correction of the mean flow every stage) or constant pressure
   gradient (`cpg`).
@@ -75,6 +76,7 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `nstep`, `tmax`, `wall_time_max` | 1000, ∞, ∞ | stop criteria (steps of this run, simulation time, seconds) |
 | `fixed_dt`, `dt`, `dt_max`, `dt_growth` | false, 1e-4, 0.05, 1.1 | fixed or adaptive time step |
 | `cfl`, `cfl_visc` | 1.2, 2.0 | RK3 limits (< √3 advective, < 2.51 diffusive) |
+| `rk_stages` | 3 | 3: Wray's low-storage RK3; 4: the 4-stage third-order RK3 of the SIMSON user guide (Table 5.1): limits √8 = 2.83 (`cfl`) and 2.79 (`cfl_visc`) at 4/3 of the cost per step, and a much smaller error at the same Δt (turbulent case: 35–500×) |
 | `init_type` | laminar | `laminar`, `noise` (random large-scale modes, amplitude `init_amp`, `init_seed`), `mode` (a wave with kx index `mode_kx`, kz index `mode_kz`), `restart` |
 | `restart_file`, `reset_time` | restart.bin, false | for `init_type = restart` |
 | `data_dir` | data | output directory |

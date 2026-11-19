@@ -32,6 +32,7 @@ struct Params {
   bool fixed_dt = false;
   double dt = 1e-4, dt_max = 0.05, dt_growth = 1.1;
   double cfl = 1.2, cfl_visc = 2.0;
+  int rk_stages = 3;  // low-storage RK3: 3 stages (Wray) or 4 stages (SIMSON user guide, Table 5.1)
   // initial condition
   std::string init_type = "laminar";  // laminar | noise | mode | restart
   double init_amp = 0.1;
@@ -85,7 +86,7 @@ struct Params {
     D("grid_alpha", grid_alpha); I("fd_order", fd_order); S("y_scheme", y_scheme); S("y_closure", y_closure); S("nl_form", nl_form); I("fd_order_z", fd_order_z); B("dealias", dealias);
     D("re", re); S("forcing", forcing); D("ubulk", ubulk); D("dpdx", dpdx);
     L("nstep", nstep); D("tmax", tmax); D("wall_time_max", wall_time_max); B("fixed_dt", fixed_dt);
-    D("dt", dt); D("dt_max", dt_max); D("dt_growth", dt_growth); D("cfl", cfl); D("cfl_visc", cfl_visc);
+    D("dt", dt); D("dt_max", dt_max); D("dt_growth", dt_growth); D("cfl", cfl); D("cfl_visc", cfl_visc); I("rk_stages", rk_stages);
     S("init_type", init_type); D("init_amp", init_amp); I("init_seed", init_seed); I("mode_kx", mode_kx);
     I("mode_kz", mode_kz); S("restart_file", restart_file); S("mode_file", mode_file); B("reset_time", reset_time);
     S("data_dir", data_dir); I("iout_log", iout_log); I("iout_stats", iout_stats);
@@ -105,8 +106,8 @@ struct Params {
     std::printf("grid      nx = %d, ny = %d, nz = %d, lx = %.6g, lz = %.6g, %s (alpha = %g), order %d (y) %d (z), dealias %d\n",
                 nx, ny, nz, lx, lz, grid_type.c_str(), grid_alpha, fd_order, fd_order_z, int(dealias));
     std::printf("physics   re = %g, forcing = %s, ubulk = %g, dpdx = %g\n", re, forcing.c_str(), ubulk, dpdx);
-    std::printf("time      nstep = %ld, tmax = %g, fixed_dt = %d, dt = %g, cfl = %g, cfl_visc = %g\n", nstep, tmax,
-                int(fixed_dt), dt, cfl, cfl_visc);
+    std::printf("time      nstep = %ld, tmax = %g, fixed_dt = %d, dt = %g, cfl = %g, cfl_visc = %g, rk_stages = %d\n",
+                nstep, tmax, int(fixed_dt), dt, cfl, cfl_visc, rk_stages);
     std::printf("init      %s, amp = %g\n", init_type.c_str(), init_amp);
   }
 };
