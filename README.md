@@ -20,10 +20,14 @@ and z) with
 The motivation and the comparison with HiCHAN (cost model, pressure-solver options, influence matrix,
 velocity–vorticity formulation, accuracy) are in [DESIGN.md](DESIGN.md).
 
-**Status:** single GPU / single CPU node. The CUDA and HIP builds have not been compiled yet (no GPU compiler
-was available where the code was written); the CPU build runs exactly the same kernel code and is tested.
-Multi-GPU (z-slabs: halo exchanges plus two all-to-alls per stage), scalars, an implicit wall-normal viscous term
-and 3D field output are not written yet.
+**Parallelisation:** MPI with z-slabs, one rank per GPU (or per CPU socket/node with threads). z-stencils use
+halo exchanges with the two neighbouring ranks; the pressure is solved after an all-to-all transpose to kx-slabs
+(two per RK stage). x-FFTs and the compact y-solves are local. Results are identical (to round-off) for any number
+of ranks, and restart files can be read on a different number of ranks.
+
+**Status:** the CUDA and HIP builds have not been compiled yet (no GPU compiler was available where the code was
+written); the CPU build runs exactly the same kernel code and is tested, with 1–4 MPI ranks. Scalars, an implicit
+wall-normal viscous term, 3D field output and a second split in y (for several hundred GPUs) are not written yet.
 
 ## Building
 
@@ -32,17 +36,27 @@ make                       # CPU (std::thread pool), build/fdchan
 make GPU=cuda ARCH=sm_90   # NVIDIA GH200/H100: nvcc + cuFFT
 make GPU=hip ARCH=gfx90a   # AMD MI250X: hipcc + hipFFT
 make SINGLE=1 ...          # single precision
+make MPI=1 ...             # several ranks: build/fdchan_mpi (MPICXX, default ~/opt/openmpi/bin/mpicxx)
 make test                  # operator and pressure-solver tests
 ```
 
-On NSC Arrhenius, `module load GPU/buildenv-nvhpc/25.9-cu13.0` provides nvcc and cuFFT.
+On NSC Arrhenius, `module load GPU/buildenv-nvhpc/25.9-cu13.0` provides nvcc, cuFFT and a CUDA-aware MPI:
+`make GPU=cuda MPI=1 MPICXX=mpicxx`. The MPI compile and link flags are taken from `mpicxx --showme:compile/link`
+(Open MPI / HPC-X); for another MPI set `MPI_CFLAGS` and `MPI_LFLAGS`. Device pointers are passed to MPI, so the MPI
+must be CUDA-aware (HIP: GPU-aware). On macOS with Open MPI and gfortran-built codes, see `../compare/COMPARISON.md`
+for the `MPI_IN_PLACE` link flag (FDCHAN itself is not affected).
 `-DFD_DEBUG_SYNC` (add to `CXXFLAGS`) checks for errors after every kernel; use it for the first GPU run.
 
 ## Running
 
 ```bash
-build/fdchan input.txt
+build/fdchan input.txt                         # one GPU / one CPU node
+mpirun -n 8 build/fdchan_mpi input.txt         # 8 ranks (GPUs), z-slabs
 ```
+
+With MPI each rank picks GPU (node-local rank) mod (GPUs per node). The z-slabs need at least p/2 = 3 planes per
+rank (6th order); for efficiency use at least ~16 (nz/P ≥ 16). `nx/2` x-modes are distributed over the ranks for
+the pressure solve. With `timing = 1` the time spent in communication is printed.
 
 The input is a text file with `key = value` lines (`!` or `#` start a comment); unknown keys are reported.
 
@@ -67,7 +81,7 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `iout_log`, `iout_stats`, `iout_save_stats`, `iout_restart`, `tstats_start` | 100, 0, 0, 0, 0 | output intervals in steps |
 | `mode_log_kx` | 1 | kx index of the mode whose v-energy is logged |
 | `timing` | false | per-part timers (synchronises the GPU) |
-| `nthreads` | all cores | CPU build only |
+| `nthreads` | all cores | CPU build only (threads per rank) |
 
 ## Tools
 

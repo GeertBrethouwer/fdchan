@@ -64,9 +64,22 @@ Decomposition: z-slabs (each GPU holds complete x-lines and y-columns for nz/P v
 That is roughly 10× less all-to-all data, and the rest is neighbour communication that can overlap with the
 interior work. Slabs limit the number of GPUs to about nz/(p/2+1), several hundred for nz = 1536.
 
-**Status:** single GPU. The storage layout (complete x-lines, (kx, z, y) order, pressure data in (z, kx, y)
-order for the transpose) was chosen so that the z-slab version only adds halo exchanges and the two
-all-to-alls; it has not been written yet.
+**Status: implemented** (`src/comm.hpp`, `Solver::halo`, `transpose_to_kx/_z`). Each stage exchanges the halos of
+u, v, w (start of the stage), of r_z (divergence) and of φ (correction), and transposes the pressure source and
+φ. Global sums (flow-rate correction, the kx = 0 plane correction of v, statistics) and maxima (time step,
+divergence) are MPI reductions. Tested on the CPU with 1–4 ranks (also uneven slabs and kx distributions): the log
+agrees with the serial build to all printed digits (11), and a restart written on 2 ranks continues on 3 ranks
+exactly as the uninterrupted run. Re_τ = 180 grid (128 × 129 × 128) on 1, 2, 4 ranks of a laptop: 6.24, 4.43,
+3.25 s per step, communication 0.01, 0.02, 0.04 s per step (1.3 % on 4 ranks; the speed-up is limited by the
+shared memory bandwidth of the laptop, not by communication).
+
+**Choice of slabs over pencils.** x-lines must stay complete (x-FFTs) and y-columns too (compact y-solves, banded
+pressure solve); only z is local-stencil. z-slabs therefore need only neighbour halos plus the two pressure
+transposes. Pencils (CaNS) would split y (compact solves across ranks: transposes or distributed tridiagonal
+solvers) or x (transposes for every FFT, HiCHAN's pattern). Slabs work while nz/P ≳ 16 (halos ≲ 40 % of a slab):
+up to ~100–200 GPUs for nz = 1536–1920. Beyond that, a second split in y (P-TDMA for the compact solves within
+small y-groups, pressure transposes from (y, z)-split to kx-split) is the planned extension; the decomposition
+code keeps py = 1 for this.
 
 ### 1.3 Compact differences in z?
 

@@ -17,7 +17,8 @@ struct Params {
   double grid_alpha = 3.0;
   int fd_order = 6;
   std::string y_scheme = "compact";  // compact (4, 6, 8) | explicit (2, 4, 6, 8)
-  std::string nl_form = "rotational";  // rotational (9 x-FFTs per stage) | advective (15)
+  std::string nl_form = "rotational";  // FDCHAN: rotational (9 x-FFTs per stage) | advective (15);
+                                       // SCCHAN: divergence (default for it, 13) | skew (33)
   std::string y_closure = "hichan";  // compact wall closures: hichan | explicit_wall
   int fd_order_z = 0;  // 0: same as fd_order
   bool dealias = true;
@@ -94,7 +95,8 @@ struct Params {
     if (fd_order % 2 || fd_order < 2 || fd_order > 8) fatal("fd_order must be 2, 4, 6 or 8");
     if (y_scheme != "compact" && y_scheme != "explicit") fatal("y_scheme must be compact or explicit");
     if (y_scheme == "compact" && fd_order != 4 && fd_order != 6 && fd_order != 8) fatal("compact y_scheme: fd_order must be 4, 6 or 8");
-    if (nl_form != "rotational" && nl_form != "advective") fatal("nl_form must be rotational or advective");
+    if (nl_form != "rotational" && nl_form != "advective" && nl_form != "divergence" && nl_form != "skew")
+      fatal("nl_form must be rotational, advective, divergence or skew");
     if (fd_order_z == 0) fd_order_z = fd_order;
     if (fd_order_z % 2 || fd_order_z < 2 || fd_order_z > 8) fatal("fd_order_z must be 2, 4, 6 or 8");
   }
