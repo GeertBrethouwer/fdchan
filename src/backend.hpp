@@ -190,6 +190,35 @@ inline void pfor(idx n, F f) {
 #endif
 }
 
+// batched 2D transpose through a shared-memory tile (as x3d2's reorder kernels): element (b, r, c), r < nr,
+// c < nc, is read with rd(b, r, c), where consecutive c are adjacent in memory, and written with
+// wr(b, r, c, value), where consecutive r are adjacent; both accesses are coalesced
+constexpr int TT = 32, TR = 8;  // tile size, thread rows per block
+template <class R, class W>
+__global__ void k_ptranspose(int nr, int nc, R rd, W wr) {
+  __shared__ real tre[TT][TT + 1], tim[TT][TT + 1];
+  const idx b = blockIdx.z;
+  const int r0 = blockIdx.y * TT, c0 = blockIdx.x * TT, tx = threadIdx.x;
+  for (int q = threadIdx.y; q < TT; q += TR)
+    if (r0 + q < nr && c0 + tx < nc) {
+      const cplx v = rd(b, r0 + q, c0 + tx);
+      tre[q][tx] = v.re; tim[q][tx] = v.im;
+    }
+  __syncthreads();
+  for (int q = threadIdx.y; q < TT; q += TR)
+    if (r0 + tx < nr && c0 + q < nc) wr(b, r0 + tx, c0 + q, cplx(tre[tx][q], tim[tx][q]));
+}
+template <class R, class W>
+inline void ptranspose(idx nb, int nr, int nc, R rd, W wr) {
+  if (nb <= 0 || nr <= 0 || nc <= 0) return;
+  const dim3 grid(unsigned((nc + TT - 1) / TT), unsigned((nr + TT - 1) / TT), unsigned(nb));
+  k_ptranspose<<<grid, dim3(TT, TR), 0, g_stream>>>(nr, nc, rd, wr);
+#ifdef FD_DEBUG_SYNC
+  gpu_check(gpuGetLastError(), "transpose launch");
+  sync();
+#endif
+}
+
 // out[r] = sum_c f(r, c), one block per row, result left on the device
 template <class F>
 __global__ void k_rowsum(int ncols, F f, double* out) {
@@ -309,11 +338,13 @@ class Pool {
   bool quit_ = false;
 };
 
+// min_par: below this n the loop runs on the calling thread (pointwise kernels); line kernels, where every
+// iteration sweeps a whole line, use pfor_lines (min_par = 1)
 template <class F>
-inline void pfor(idx n, F f) {
+inline void pfor(idx n, F f, idx min_par = 2048) {
   Pool& P = Pool::get();
   const int nt = P.threads();
-  if (nt == 1 || n < 2048) {
+  if (nt == 1 || n < min_par) {
     for (idx i = 0; i < n; ++i) f(i);
     return;
   }
@@ -346,6 +377,41 @@ inline double reduce_max(idx n, F f) {
   return m;
 }
 #endif
+
+#ifndef FD_GPU
+// CPU version of ptranspose: the same tiles and the same index arithmetic as the GPU kernel (one tile per
+// iteration; the loops over q and tx stand for the thread block)
+constexpr int TT = 32, TR = 8;
+template <class R, class W>
+inline void ptranspose(idx nb, int nr, int nc, R rd, W wr) {
+  if (nb <= 0 || nr <= 0 || nc <= 0) return;
+  const idx tc = (nc + TT - 1) / TT, tr = (nr + TT - 1) / TT;
+  pfor(nb * tr * tc, [&](idx t) {
+    cplx tile[TT][TT + 1];
+    const idx b = t / (tr * tc);
+    const int r0 = int((t / tc) % tr) * TT, c0 = int(t % tc) * TT;
+    for (int ty = 0; ty < TR; ++ty)
+      for (int q = ty; q < TT; q += TR)
+        for (int tx = 0; tx < TT; ++tx)
+          if (r0 + q < nr && c0 + tx < nc) tile[q][tx] = rd(b, r0 + q, c0 + tx);
+    for (int ty = 0; ty < TR; ++ty)
+      for (int q = ty; q < TT; q += TR)
+        for (int tx = 0; tx < TT; ++tx)
+          if (r0 + tx < nr && c0 + q < nc) wr(b, r0 + tx, c0 + q, tile[tx][q]);
+  }, 1);
+}
+#endif
+
+// a loop whose iterations each sweep a whole line (y-solves, pressure columns): on the CPU split over the
+// threads however few there are
+template <class F>
+inline void pfor_lines(idx n, F f) {
+#ifdef FD_GPU
+  pfor(n, f);
+#else
+  pfor(n, f, 1);
+#endif
+}
 
 // copy a few doubles from the device (diagnostics only)
 inline std::vector<double> fetch(const double* d, int n) {

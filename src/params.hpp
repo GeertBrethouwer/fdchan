@@ -46,6 +46,7 @@ struct Params {
   double tstats_start = 0;
   int mode_log_kx = 1;
   bool timing = false;
+  bool fuse_y = true;  // FDCHAN: y-derivatives formed inside the kernels that use them (one thread per line)
   // CPU only
   int nthreads = 0;
 
@@ -89,7 +90,7 @@ struct Params {
     I("mode_kz", mode_kz); S("restart_file", restart_file); S("mode_file", mode_file); B("reset_time", reset_time);
     S("data_dir", data_dir); I("iout_log", iout_log); I("iout_stats", iout_stats);
     I("iout_save_stats", iout_save_stats); I("iout_restart", iout_restart); D("tstats_start", tstats_start);
-    I("mode_log_kx", mode_log_kx); B("timing", timing); I("nthreads", nthreads);
+    I("mode_log_kx", mode_log_kx); B("timing", timing); B("fuse_y", fuse_y); I("nthreads", nthreads);
     for (auto& p : kv) std::fprintf(stderr, "warning: unknown input item '%s'\n", p.first.c_str());
     if (nx % 2) fatal("nx must be even");
     if (fd_order % 2 || fd_order < 2 || fd_order > 8) fatal("fd_order must be 2, 4, 6 or 8");

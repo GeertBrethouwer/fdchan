@@ -153,6 +153,10 @@ FFTs, right-hand side, pressure, other, and the communication contained in them 
 `timing = 1` synchronises the GPU around every part; for the final number of a configuration run once more with
 `timing = 0`.
 
+Run B and F1 a second time with `fuse_y = 0`. The default `fuse_y = 1` forms the y-derivatives inside the kernels
+that use them; it reads and writes less memory but uses one GPU thread per y-line instead of one per point. Both
+give the same `log.dat` to the last digit; keep whichever is faster (expected: `fuse_y = 1` for the large grids).
+
 ### 4.1 One GPU, Re_τ = 180
 
 | run | code | grid | input |
@@ -189,8 +193,9 @@ From the memory-traffic model in DESIGN.md: at the same grid one FDCHAN stage mo
 HiCHAN stage. If both codes reach a similar fraction of the memory bandwidth, B should be 1.3–1.7× faster per step
 than A, and C about as fast as A. This is uncertain in both directions:
 
-- against FDCHAN: its kernels are not tuned yet (plain transposes in the pressure step, the banded LU keeps its rows
-  in local memory, no kernel fusion across operators);
+- against FDCHAN: its kernels are only partly tuned (the banded LU keeps its rows in local memory; the y-derivatives
+  are fused into the kernels that use them and the all-to-all packing uses tiled transposes, but neither has run on a
+  GPU yet);
 - for FDCHAN: one x-FFT per transform instead of a 2D FFT plus two transposes, on a grid without z-dealiasing.
 
 For this small grid (2–3 million points) kernel-launch overhead may dominate both codes.

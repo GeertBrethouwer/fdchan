@@ -47,12 +47,68 @@ struct ZSt {  // periodic central stencils in z, a[l + h], l = -h..h, already di
   real a1[2 * MAXP2 + 1], a2[2 * MAXP2 + 1];
 };
 
+// NF fields swept together along y: the inputs and the arrays that hold the forward-sweep values
+template <int NF>
+struct YLines {
+  const cplx* in[NF];
+  cplx* tmp[NF];
+};
+
 // value of f at local plane kk (may lie in the halo), mode i, row j; L = line length of f, W = halo width
 HD inline cplx zv(const cplx* f, const cplx* hal, idx L, int i, int kk, int j, int nzl, int h, int ny, int W) {
   if (kk >= 0 && kk < nzl) return f[(idx(j) * nzl + kk) * L + i];
   if (kk < 0) return hal[(idx(j) * h + (kk + h)) * W + i];
   return hal[idx(ny) * h * W + (idx(j) * h + (kk - nzl)) * W + i];
 }
+
+// pointwise part of rhs(): H = N + nu Lap f, r = f + dtg H + dtz H_old at spectral point n (padded point o)
+struct RhsPoint {
+  const cplx *f, *hf;
+  cplx *h, *r;
+  const real* kx;
+  ZSt z;
+  int nkx, nz, ny;
+  real sc, nuu, dtg, dtz, force;
+  HD void operator()(idx n, idx o, int i, int k, int j, cplx d2y) const {
+    if (j == 0 || j == ny - 1) {
+      r[o] = cplx(0, 0);
+      h[n] = cplx(0, 0);
+      return;
+    }
+    const cplx fc = f[n];
+    cplx lap = (-kx[i] * kx[i]) * fc + d2y;
+    for (int l = -z.h; l <= z.h; ++l) lap += z.a2[l + z.h] * zv(f, hf, nkx, i, k + l, j, nz, z.h, ny, nkx);
+    cplx hh = sc * r[o] + nuu * lap;
+    if (i == 0) hh.re += force;
+    r[o] = fc + dtg * hh + dtz * h[n];
+    h[n] = hh;
+  }
+};
+
+// pointwise part of nonlinear(): u, v, w and the vorticity into the padded arrays C0..C5 at padded point n
+struct VortPoint {
+  const cplx *U, *V, *W, *hU, *hV;
+  cplx *C0, *C1, *C2, *C3, *C4, *C5;
+  const real* kx;
+  ZSt z;
+  int nkx, nz, ny;
+  HD void operator()(idx n, idx s, int i, int k, int j, cplx dyu, cplx dyw) const {
+    cplx dzu(0, 0), dzv(0, 0);
+    for (int l = -z.h; l <= z.h; ++l) {
+      if (l == 0) continue;
+      dzu += z.a1[l + z.h] * zv(U, hU, nkx, i, k + l, j, nz, z.h, ny, nkx);
+      dzv += z.a1[l + z.h] * zv(V, hV, nkx, i, k + l, j, nz, z.h, ny, nkx);
+    }
+    cplx uu = U[s], vv = V[s], ww = W[s];
+    cplx ox = dyw - dzv, oy = dzu - itimes(kx[i], ww), oz = itimes(kx[i], vv) - dyu;
+    if (i == 0) { uu.im = 0; vv.im = 0; ww.im = 0; ox.im = 0; oy.im = 0; oz.im = 0; }
+    C0[n] = uu; C1[n] = vv; C2[n] = ww; C3[n] = ox; C4[n] = oy; C5[n] = oz;
+  }
+  HD void zero(idx n) const {
+    const cplx zz(0, 0);
+    C0[n] = zz; C1[n] = zz; C2[n] = zz; C3[n] = zz; C4[n] = zz; C5[n] = zz;
+  }
+};
 
 class Solver {
  public:
@@ -285,14 +341,10 @@ class Solver {
     const int *own = d_kxown.p, *off = d_kxoff.p, *cnt = d_cnt.p, *zown = d_zown.p, *zoff = d_zoff.p, *nzr = d_nzr.p;
     const idx *sd = d_sd.p, *rd = d_rd.p;
     cplx *sb = sbuf.p, *rb = rbuf.p;
-    pfor(nsp, [=] HD(idx n) {
-      const int i = int(n % nkx_);
-      const idx kj = n / nkx_;
-      const int k = int(kj % nz_);
-      const idx j = kj / nz_;
-      const int r = own[i];
-      sb[sd[r] + (j * cnt[r] + off[i]) * nz_ + k] = t1[n];
-    });
+    // per y-row a (z, kx) -> (kx, z) transpose: tiled, so that reads and writes are both coalesced
+    ptranspose(ny, nz_, nkx_,
+        [=] HD(idx j, int k, int i) -> cplx { return t1[(j * nz_ + k) * nkx_ + i]; },
+        [=] HD(idx j, int k, int i, cplx val) { const int r = own[i]; sb[sd[r] + (j * cnt[r] + off[i]) * nz_ + k] = val; });
     auto t0 = tick();
     g_comm.alltoallv(reinterpret_cast<real*>(sbuf.p), a2a_sc, a2a_sd, reinterpret_cast<real*>(rbuf.p), a2a_rc, a2a_rd);
     t_comm += tick() - t0;
@@ -318,14 +370,9 @@ class Solver {
     auto t0 = tick();
     g_comm.alltoallv(reinterpret_cast<real*>(rbuf.p), a2a_rc, a2a_rd, reinterpret_cast<real*>(sbuf.p), a2a_sc, a2a_sd);
     t_comm += tick() - t0;
-    pfor(nsp, [=] HD(idx n) {
-      const int i = int(n % nkx_);
-      const idx kj = n / nkx_;
-      const int k = int(kj % nz_);
-      const idx j = kj / nz_;
-      const int r = own[i];
-      t1[n] = sb[sd[r] + (j * cnt[r] + off[i]) * nz_ + k];
-    });
+    ptranspose(ny, nkx_, nz_,
+        [=] HD(idx j, int i, int k) -> cplx { const int r = own[i]; return sb[sd[r] + (j * cnt[r] + off[i]) * nz_ + k]; },
+        [=] HD(idx j, int i, int k, cplx val) { t1[(j * nz_ + k) * nkx_ + i] = val; });
   }
   // fill the halo buffer of f (line length L, first W entries of each line) from the neighbouring ranks
   void halo(const cplx* f, idx L, cplx* hal) {
@@ -411,24 +458,44 @@ class Solver {
   void ydiff(int d, const cplx* in, cplx* out) {
     const YDev D = ydev(d);
     const idx nl = idx(nz) * nkx;
-    pfor(nl, [=] HD(idx l) {
-      cplx prev(0, 0);
-      for (int j = 0; j < D.n; ++j) {
-        cplx g(0, 0);
-        const int s = D.s[j];
-        for (int m = 0; m < D.W; ++m) g += D.c[j * D.W + m] * in[idx(s + m) * nl + l];
-        if (D.compact && j > 0) g -= D.m[j] * prev;
-        out[idx(j) * nl + l] = g;
-        prev = g;
-      }
-      if (!D.compact) return;
-      cplx x = D.id[D.n - 1] * prev;
-      out[idx(D.n - 1) * nl + l] = x;
-      for (int j = D.n - 2; j >= 0; --j) {
-        x = D.id[j] * (out[idx(j) * nl + l] - D.up[j] * x);
-        out[idx(j) * nl + l] = x;
-      }
+    YLines<1> L;
+    L.in[0] = in; L.tmp[0] = out;
+    pfor_lines(nl, [=] HD(idx l) {
+      ysweep<1>(D, L, nl, l, [&](int j, const cplx* x) { out[idx(j) * nl + l] = x[0]; });
     });
+  }
+  // y derivative of NF fields along line l (stride nl), for use inside a kernel: emit(j, x) receives the
+  // derivatives x[0..NF) at row j as soon as they are final, so the caller can use them without storing them
+  // (x3d2's fused transport kernels). Compact schemes: rows come in decreasing j, and L.tmp holds the
+  // forward-sweep values afterwards (L.tmp may equal the output array of emit). Explicit: increasing j, L.tmp
+  // unused. The arithmetic is that of the separate derivative followed by a pointwise kernel.
+  template <int NF, class E>
+  static HD void ysweep(const YDev& D, const YLines<NF>& L, idx nl, idx l, E&& emit) {
+    cplx prev[NF], g[NF];
+    for (int f = 0; f < NF; ++f) prev[f] = cplx(0, 0);
+    for (int j = 0; j < D.n; ++j) {
+      const int s = D.s[j];
+      for (int f = 0; f < NF; ++f) g[f] = cplx(0, 0);
+      for (int m = 0; m < D.W; ++m) {
+        const real c = D.c[j * D.W + m];
+        const idx o = idx(s + m) * nl + l;
+        for (int f = 0; f < NF; ++f) g[f] += c * L.in[f][o];
+      }
+      if (D.compact) {
+        if (j > 0)
+          for (int f = 0; f < NF; ++f) g[f] -= D.m[j] * prev[f];
+        for (int f = 0; f < NF; ++f) { L.tmp[f][idx(j) * nl + l] = g[f]; prev[f] = g[f]; }
+      } else {
+        emit(j, static_cast<const cplx*>(g));
+      }
+    }
+    if (!D.compact) return;
+    for (int f = 0; f < NF; ++f) g[f] = D.id[D.n - 1] * prev[f];
+    emit(D.n - 1, static_cast<const cplx*>(g));
+    for (int j = D.n - 2; j >= 0; --j) {
+      for (int f = 0; f < NF; ++f) g[f] = D.id[j] * (L.tmp[f][idx(j) * nl + l] - D.up[j] * g[f]);
+      emit(j, static_cast<const cplx*>(g));
+    }
   }
 
   // 1-2: nonlinear term u x omega in P3..P5 (spectral, padded, unnormalised)
@@ -438,36 +505,41 @@ class Solver {
     halo(w.p, nkx, hbC.p);
     if (P.nl_form == "advective") { nonlinear_advective(); return; }
     const int nkx_ = nkx, lp_ = lp, ld_ = ld, mx_ = mx, nz_ = nz, ny_ = ny;
-    ydiff(0, u.p, T1.p);
-    ydiff(0, w.p, T2.p);
-    const cplx *U = u.p, *V = v.p, *Wv = w.p, *dyu = T1.p, *dyw = T2.p;
-    const real* kx = d_kx.p;
-    cplx* C[6];
-    for (int c = 0; c < 6; ++c) C[c] = reinterpret_cast<cplx*>(Pb[c].p);
-    cplx *C0 = C[0], *C1 = C[1], *C2 = C[2], *C3 = C[3], *C4 = C[4], *C5 = C[5];
-    const ZSt z = zs;
-    const cplx *hU = hbA.p, *hV = hbB.p;
-    pfor(idx(lp_) * nz_ * ny_, [=] HD(idx n) {
-      const int i = int(n % lp_);
-      const idx kj = n / lp_;
-      if (i < nkx_) {
-        const int k = int(kj % nz_), j = int(kj / nz_);
-        const idx s = kj * nkx_ + i;
-        cplx dzu(0, 0), dzv(0, 0);
-        for (int l = -z.h; l <= z.h; ++l) {
-          if (l == 0) continue;
-          dzu += z.a1[l + z.h] * zv(U, hU, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
-          dzv += z.a1[l + z.h] * zv(V, hV, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
+    VortPoint pt;
+    pt.U = u.p; pt.V = v.p; pt.W = w.p; pt.hU = hbA.p; pt.hV = hbB.p;
+    pt.C0 = reinterpret_cast<cplx*>(Pb[0].p); pt.C1 = reinterpret_cast<cplx*>(Pb[1].p);
+    pt.C2 = reinterpret_cast<cplx*>(Pb[2].p); pt.C3 = reinterpret_cast<cplx*>(Pb[3].p);
+    pt.C4 = reinterpret_cast<cplx*>(Pb[4].p); pt.C5 = reinterpret_cast<cplx*>(Pb[5].p);
+    pt.kx = d_kx.p; pt.z = zs; pt.nkx = nkx_; pt.nz = nz_; pt.ny = ny_;
+    const idx nl = idx(nz_) * nkx_;
+    if (P.fuse_y) {
+      // Dy u and Dy w are formed in one y-sweep and used at once: one thread per padded (x, z) line
+      const YDev D = ydev(0);
+      YLines<2> L;
+      L.in[0] = u.p; L.in[1] = w.p; L.tmp[0] = T1.p; L.tmp[1] = T2.p;
+      pfor_lines(idx(lp_) * nz_, [=] HD(idx lq) {
+        const int i = int(lq % lp_), k = int(lq / lp_);
+        if (i >= nkx_) {
+          for (int j = 0; j < ny_; ++j) pt.zero((idx(j) * nz_ + k) * lp_ + i);
+          return;
         }
-        cplx uu = U[s], vv = V[s], ww = Wv[s];
-        cplx ox = dyw[s] - dzv, oy = dzu - itimes(kx[i], ww), oz = itimes(kx[i], vv) - dyu[s];
-        if (i == 0) { uu.im = 0; vv.im = 0; ww.im = 0; ox.im = 0; oy.im = 0; oz.im = 0; }
-        C0[n] = uu; C1[n] = vv; C2[n] = ww; C3[n] = ox; C4[n] = oy; C5[n] = oz;
-      } else {
-        const cplx zz(0, 0);
-        C0[n] = zz; C1[n] = zz; C2[n] = zz; C3[n] = zz; C4[n] = zz; C5[n] = zz;
-      }
-    });
+        const idx ln = idx(k) * nkx_ + i;
+        ysweep<2>(D, L, nl, ln, [&](int j, const cplx* dy) {
+          pt((idx(j) * nz_ + k) * lp_ + i, idx(j) * nl + ln, i, k, j, dy[0], dy[1]);
+        });
+      });
+    } else {
+      ydiff(0, u.p, T1.p);
+      ydiff(0, w.p, T2.p);
+      const cplx *dyu = T1.p, *dyw = T2.p;
+      pfor(idx(lp_) * nz_ * ny_, [=] HD(idx n) {
+        const int i = int(n % lp_);
+        const idx kj = n / lp_;
+        if (i >= nkx_) { pt.zero(n); return; }
+        const idx s = kj * nkx_ + i;
+        pt(n, s, i, int(kj % nz_), int(kj / nz_), dyu[s], dyw[s]);
+      });
+    }
     for (int c = 0; c < 6; ++c) xfft.backward(Pb[c].p);
     const real *pu = Pb[0].p, *pv = Pb[1].p, *pw = Pb[2].p;
     real *p3 = Pb[3].p, *p4 = Pb[4].p, *p5 = Pb[5].p;
@@ -576,6 +648,8 @@ class Solver {
     for (int c = 0; c < 3; ++c) R[c] = reinterpret_cast<cplx*>(Pb[3 + c].p);
     const real* kx = d_kx.p;
     const ZSt z = zs;
+    const YDev D = ydev(1);
+    const idx nl = idx(nz_) * nkx_;
     const cplx* HB[3] = {hbA.p, hbB.p, hbC.p};
     for (int c = 0; c < 3; ++c) {
       const cplx* f = F[c];
@@ -583,26 +657,30 @@ class Solver {
       cplx* h = H[c];
       cplx* r = R[c];
       const real force = (c == 0) ? fx : real(0);
-      ydiff(1, f, T1.p);
-      const cplx* d2y = T1.p;
-      pfor(nsp, [=] HD(idx n) {
-        const int i = int(n % nkx_);
-        const idx kj = n / nkx_;
-        const int k = int(kj % nz_), j = int(kj / nz_);
-        const idx o = kj * lp_ + i;
-        if (j == 0 || j == ny_ - 1) {
-          r[o] = cplx(0, 0);
-          h[n] = cplx(0, 0);
-          return;
-        }
-        const cplx fc = f[n];
-        cplx lap = (-kx[i] * kx[i]) * fc + d2y[n];
-        for (int l = -z.h; l <= z.h; ++l) lap += z.a2[l + z.h] * zv(f, hf, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
-        cplx hh = sc * r[o] + nuu * lap;
-        if (i == 0) hh.re += force;
-        r[o] = fc + dtg * hh + dtz * h[n];
-        h[n] = hh;
-      });
+      RhsPoint pt;
+      pt.f = f; pt.hf = hf; pt.h = h; pt.r = r; pt.kx = kx; pt.z = z;
+      pt.nkx = nkx_; pt.nz = nz_; pt.ny = ny_;
+      pt.sc = sc; pt.nuu = nuu; pt.dtg = dtg; pt.dtz = dtz; pt.force = force;
+      if (P.fuse_y) {
+        // D2y f is formed in the y-sweep and used at once (x3d2's fused transport kernels): one thread per
+        // (kx, z) line, no D2y array written and read again
+        YLines<1> L;
+        L.in[0] = f; L.tmp[0] = T1.p;
+        pfor_lines(nl, [=] HD(idx ln) {
+          const int i = int(ln % nkx_), k = int(ln / nkx_);
+          ysweep<1>(D, L, nl, ln, [&](int j, const cplx* d2y) {
+            pt(idx(j) * nl + ln, (idx(j) * nz_ + k) * lp_ + i, i, k, j, d2y[0]);
+          });
+        });
+      } else {
+        ydiff(1, f, T1.p);
+        const cplx* d2y = T1.p;
+        pfor(nsp, [=] HD(idx n) {
+          const int i = int(n % nkx_);
+          const idx kj = n / nkx_;
+          pt(n, kj * lp_ + i, i, int(kj % nz_), int(kj / nz_), d2y[n]);
+        });
+      }
     }
   }
 
@@ -706,7 +784,7 @@ class Solver {
     real *su = d_su.p, *sy = d_sy.p;
     cplx* t2 = T2.p;
     const real inz = real(1.0 / nzg);
-    pfor(nc, [=] HD(idx col) {
+    pfor_lines(nc, [=] HD(idx col) {
       const int t = int(col % ntz_), i = int(col / ntz_);
       const int t2i = (nz_ - t) % nz_;
       const bool paired = (t != 0) && (2 * t != nz_);

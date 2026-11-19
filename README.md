@@ -81,6 +81,7 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `iout_log`, `iout_stats`, `iout_save_stats`, `iout_restart`, `tstats_start` | 100, 0, 0, 0, 0 | output intervals in steps |
 | `mode_log_kx` | 1 | kx index of the mode whose v-energy is logged |
 | `timing` | false | per-part timers (synchronises the GPU) |
+| `fuse_y` | true | form the y-derivatives inside the kernels that use them (one thread per y-line, no derivative arrays written and read back; as x3d2's fused transport kernels). `false`: separate derivative and pointwise kernels. Same results to the last bit |
 | `nthreads` | all cores | CPU build only (threads per rank) |
 
 ## Tools
