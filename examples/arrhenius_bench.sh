@@ -13,7 +13,7 @@
 
 module load GPU/buildenv-nvhpc/25.9-cu13.0
 
-FDCHAN=$HOME/fdchan/build/fdchan          # make GPU=cuda ARCH=sm_90
+FDCHAN=$HOME/fdchan/build/fdchan_gpu      # make GPU=cuda ARCH=sm_90 EXE=build/fdchan_gpu (see Test.md)
 HICHAN=$HOME/hichan/build/hichan          # make CONFIG=configs/arrhenius.mk
 export LD_LIBRARY_PATH=$HOME/hichan/dependencies/cuDecomp/build/lib:$LD_LIBRARY_PATH
 export NCCL_NET_PLUGIN=none NCCL_NET=Socket NCCL_DEBUG=WARN

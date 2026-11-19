@@ -26,7 +26,7 @@ halo exchanges with the two neighbouring ranks; the pressure is solved after an 
 of ranks, and restart files can be read on a different number of ranks.
 
 **Status:** the CUDA and HIP builds have not been compiled yet (no GPU compiler was available where the code was
-written); the CPU build runs exactly the same kernel code and is tested, with 1–4 MPI ranks. Scalars, an implicit
+written; [Test.md](Test.md) describes the tests on Arrhenius); the CPU build runs exactly the same kernel code and is tested, with 1–4 MPI ranks. Scalars, an implicit
 wall-normal viscous term, 3D field output and a second split in y (for several hundred GPUs) are not written yet.
 
 ## Building
