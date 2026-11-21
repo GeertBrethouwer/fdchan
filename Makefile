@@ -19,6 +19,9 @@ DEFS += -DFD_MPI
 MPI_CFLAGS := $(shell $(MPICXX) --showme:compile 2>/dev/null)
 MPI_LFLAGS := $(shell $(MPICXX) --showme:link 2>/dev/null)
 endif
+# nvcc and hipcc do not accept GCC's -Wl,opt (e.g. the rpath flags of Open MPI); pass them as -Xlinker opt
+comma := ,
+MPI_LFLAGS_DEV = $(subst -Wl$(comma),-Xlinker ,$(MPI_LFLAGS))
 
 ifeq ($(GPU),cuda)
 ARCH ?= sm_90
@@ -27,7 +30,7 @@ CXXFLAGS = -O3 -std=c++17 -x cu --extended-lambda --expt-relaxed-constexpr -arch
 LIBS = -lcufft
 ifeq ($(MPI),1)
 CXXFLAGS += $(MPI_CFLAGS)
-LIBS += $(MPI_LFLAGS)
+LIBS += $(MPI_LFLAGS_DEV)
 endif
 else ifeq ($(GPU),hip)
 CXX = hipcc
@@ -35,7 +38,7 @@ CXXFLAGS = -O3 -std=c++17 --offload-arch=$(if $(ARCH),$(ARCH),gfx90a) -DFD_HIP
 LIBS = -lhipfft
 ifeq ($(MPI),1)
 CXXFLAGS += $(MPI_CFLAGS)
-LIBS += $(MPI_LFLAGS)
+LIBS += $(MPI_LFLAGS_DEV)
 endif
 else
 ifeq ($(MPI),1)
