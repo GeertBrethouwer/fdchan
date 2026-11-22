@@ -126,13 +126,19 @@ int main(int argc, char** argv) {
 #endif
   }
   gpu_check(gpuStreamCreate(&g_stream), "stream");
-  if (root) std::printf("FDCHAN (GPU build, %d rank(s), %s precision)\n", g_comm.size, sizeof(real) == 8 ? "double" : "single");
+  if (P.comm_backend.empty()) P.comm_backend = Comm::nccl_built() ? "nccl" : "mpi";
+  g_comm.init_nccl(P.comm_backend == "nccl");
+  if (root)
+    std::printf("FDCHAN (GPU build, %d rank(s), %s precision, halos and all-to-alls with %s)\n", g_comm.size,
+                sizeof(real) == 8 ? "double" : "single", g_comm.size == 1 ? "local copies" : g_comm.use_nccl ? "NCCL" : "MPI");
 #else
   const int nt = P.nthreads > 0 ? P.nthreads : int(std::max(1u, std::thread::hardware_concurrency()));
   Pool::get().set_threads(nt);
+  if (P.comm_backend.empty()) P.comm_backend = Comm::nccl_built() ? "nccl" : "mpi";
+  g_comm.init_nccl(P.comm_backend == "nccl");  // CPU: only with the test stand-in (tests/nccl_mock.hpp)
   if (root)
-    std::printf("FDCHAN (CPU build, %d rank(s) x %d threads, %s precision)\n", g_comm.size, nt,
-                sizeof(real) == 8 ? "double" : "single");
+    std::printf("FDCHAN (CPU build, %d rank(s) x %d threads, %s precision%s)\n", g_comm.size, nt,
+                sizeof(real) == 8 ? "double" : "single", g_comm.use_nccl ? ", NCCL test stand-in" : "");
 #endif
   if (root) P.print();
   if (root) mkdir(P.data_dir.c_str(), 0755);

@@ -19,7 +19,7 @@ Build four executables. `EXE=` gives each its own name; without it every build w
 
 ```bash
 make GPU=cuda ARCH=sm_90 EXE=build/fdchan_gpu                                        # 1 GPU
-make GPU=cuda ARCH=sm_90 MPI=1 MPICXX=mpicxx EXE=build/fdchan_gpu_mpi                # several GPUs
+make GPU=cuda ARCH=sm_90 MPI=1 NCCL=1 MPICXX=mpicxx EXE=build/fdchan_gpu_mpi         # several GPUs
 make GPU=cuda ARCH=sm_90 DEFS=-DFD_DEBUG_SYNC EXE=build/fdchan_gpu_dbg               # error check after every kernel
 make CXX=g++ EXE=build/fdchan_cpu                                                    # CPU reference (Grace)
 ```
@@ -136,7 +136,19 @@ On one node, Open MPI's libfabric (OFI) components abort in `MPI_Init` on Arrhen
 export OMPI_MCA_btl=^ofi OMPI_MCA_mtl=^ofi
 ```
 
-If the run crashes in `MPI_Sendrecv` or `MPI_Alltoallv` (segmentation fault, `cuda` errors from UCX), the MPI is not
+With `NCCL=1` the halo exchanges and all-to-alls use NCCL. On one node NCCL's network plugin must be switched off
+(it fails on Arrhenius as for HiCHAN); the job script does this:
+
+```bash
+export NCCL_NET_PLUGIN=none NCCL_NET=Socket NCCL_DEBUG=WARN
+```
+
+A first 4-GPU run (about 1e9 points) with the MPI path spent 9.3 of 10.5 s per step in the all-to-alls (1–2 GB/s
+per GPU). With NCCL the `all-to-all transposes` line of the timing report should drop to well under 0.1 s per
+step. Compare both paths in one build with `comm_backend = mpi` / `nccl` in the input: `log.dat` must agree to all
+printed digits (on the CPU, with a test stand-in for NCCL, they agree bit for bit).
+
+If an MPI run (`comm_backend = mpi`) crashes in `MPI_Sendrecv` or `MPI_Alltoallv` (segmentation fault, `cuda` errors from UCX), the MPI is not
 handling device pointers. Tell me; staging through host memory is a small change.
 
 ### 3.2 Restart on a different number of GPUs

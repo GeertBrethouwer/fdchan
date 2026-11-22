@@ -24,7 +24,9 @@ velocity–vorticity formulation, accuracy) are in [DESIGN.md](DESIGN.md).
 **Parallelisation:** MPI with z-slabs, one rank per GPU (or per CPU socket/node with threads). z-stencils use
 halo exchanges with the two neighbouring ranks; the pressure is solved after an all-to-all transpose to kx-slabs
 (two per RK stage). x-FFTs and the compact y-solves are local. Results are identical (to round-off) for any number
-of ranks, and restart files can be read on a different number of ranks.
+of ranks, and restart files can be read on a different number of ranks. With `NCCL=1` (GPU builds) the halo
+exchanges and all-to-alls go through NCCL (RCCL on AMD), which uses NVLink between the GPUs of a node and runs on
+the solver stream; MPI still starts the ranks and does the reductions and restart files.
 
 **Status:** the CUDA and HIP builds have not been compiled yet (no GPU compiler was available where the code was
 written; [Test.md](Test.md) describes the tests on Arrhenius); the CPU build runs exactly the same kernel code and is tested, with 1–4 MPI ranks. Scalars, an implicit
@@ -38,11 +40,14 @@ make GPU=cuda ARCH=sm_90   # NVIDIA GH200/H100: nvcc + cuFFT
 make GPU=hip ARCH=gfx90a   # AMD MI250X: hipcc + hipFFT
 make SINGLE=1 ...          # single precision
 make MPI=1 ...             # several ranks: build/fdchan_mpi (MPICXX, default ~/opt/openmpi/bin/mpicxx)
+make GPU=cuda MPI=1 NCCL=1 # halo exchanges and all-to-alls with NCCL (recommended for several GPUs)
 make test                  # operator and pressure-solver tests
 ```
 
 On NSC Arrhenius, `module load GPU/buildenv-nvhpc/25.9-cu13.0` provides nvcc, cuFFT and a CUDA-aware MPI:
-`make GPU=cuda MPI=1 MPICXX=mpicxx`. The MPI compile and link flags are taken from `mpicxx --showme:compile/link`
+`make GPU=cuda MPI=1 NCCL=1 MPICXX=mpicxx`. NCCL is taken from the HPC SDK next to nvcc (`tools/find_nccl.sh`; set
+`NCCL_HOME` to override). On one node Open MPI's device-pointer path through shared memory reached only 1–2 GB/s
+per GPU there, about 50× slower than NVLink; NCCL avoids it. The MPI compile and link flags are taken from `mpicxx --showme:compile/link`
 (Open MPI / HPC-X); for another MPI set `MPI_CFLAGS` and `MPI_LFLAGS`. Device pointers are passed to MPI, so the MPI
 must be CUDA-aware (HIP: GPU-aware). On macOS with Open MPI and gfortran-built codes, see `../compare/COMPARISON.md`
 for the `MPI_IN_PLACE` link flag (FDCHAN itself is not affected).
@@ -84,6 +89,7 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `iout_log`, `iout_stats`, `iout_save_stats`, `iout_restart`, `tstats_start` | 100, 0, 0, 0, 0 | output intervals in steps |
 | `mode_log_kx` | 1 | kx index of the mode whose v-energy is logged |
 | `timing`, `timing_sync` | false, true | timers as in HiCHAN: `timing_report.txt` and `timing_steps.dat` (see Output). `timing_sync` makes every timer wait for the GPU (exact attribution of the time to the parts) |
+| `comm_backend` | nccl (NCCL=1 builds), else mpi | `nccl` or `mpi` for the halo exchanges and all-to-alls; `mpi` needs a CUDA-aware MPI |
 | `fuse_y` | true | form the y-derivatives inside the kernels that use them (one thread per y-line, no derivative arrays written and read back; as x3d2's fused transport kernels). `false`: separate derivative and pointwise kernels. Same results to the last bit |
 | `nthreads` | all cores | CPU build only (threads per rank) |
 

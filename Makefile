@@ -3,11 +3,14 @@
 # make GPU=hip        AMD (hipcc + hipFFT), set ARCH (default gfx90a for MI250X)
 # make SINGLE=1       single precision
 # make MPI=1          several ranks (z-slabs): MPICXX (CPU) or nvcc/hipcc with the MPI compile/link flags
+# make GPU=cuda MPI=1 NCCL=1  halo exchanges and all-to-alls with NCCL (NVLink); GPU=hip: RCCL.
+#                     NCCL_HOME is found next to nvcc in the NVIDIA HPC SDK (tools/find_nccl.sh) unless set
 GPU    ?=
 MPI    ?= 0
 MPICXX ?= $(HOME)/opt/openmpi/bin/mpicxx
 ARCH   ?=
 SINGLE ?= 0
+NCCL   ?= 0
 SRC = src/main.cpp
 HDR = $(wildcard src/*.hpp)
 DEFS =
@@ -22,6 +25,19 @@ endif
 # nvcc and hipcc do not accept GCC's -Wl,opt (e.g. the rpath flags of Open MPI); pass them as -Xlinker opt
 comma := ,
 MPI_LFLAGS_DEV = $(subst -Wl$(comma),-Xlinker ,$(MPI_LFLAGS))
+ifeq ($(NCCL),1)
+DEFS += -DFD_NCCL
+ifeq ($(GPU),cuda)
+NCCL_HOME ?= $(shell sh tools/find_nccl.sh)
+NCCL_LIB = -lnccl
+else
+NCCL_LIB = -lrccl
+endif
+ifneq ($(strip $(NCCL_HOME)),)
+NCCL_CFLAGS = -I$(NCCL_HOME)/include
+NCCL_LFLAGS = -L$(NCCL_HOME)/lib -Xlinker -rpath -Xlinker $(NCCL_HOME)/lib
+endif
+endif
 
 ifeq ($(GPU),cuda)
 ARCH ?= sm_90
@@ -32,6 +48,10 @@ ifeq ($(MPI),1)
 CXXFLAGS += $(MPI_CFLAGS)
 LIBS += $(MPI_LFLAGS_DEV)
 endif
+ifeq ($(NCCL),1)
+CXXFLAGS += $(NCCL_CFLAGS)
+LIBS += $(NCCL_LFLAGS) $(NCCL_LIB)
+endif
 else ifeq ($(GPU),hip)
 CXX = hipcc
 CXXFLAGS = -O3 -std=c++17 --offload-arch=$(if $(ARCH),$(ARCH),gfx90a) -DFD_HIP
@@ -39,6 +59,10 @@ LIBS = -lhipfft
 ifeq ($(MPI),1)
 CXXFLAGS += $(MPI_CFLAGS)
 LIBS += $(MPI_LFLAGS_DEV)
+endif
+ifeq ($(NCCL),1)
+CXXFLAGS += $(NCCL_CFLAGS)
+LIBS += $(NCCL_LFLAGS) $(NCCL_LIB)
 endif
 else
 ifeq ($(MPI),1)
