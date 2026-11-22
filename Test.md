@@ -128,6 +128,14 @@ Expected:
 - r1 agrees with `fdchan_gpu` of 2.3 to all printed digits (`fdchan_gpu` and `fdchan_gpu_mpi` on one rank do the same
   arithmetic).
 
+On one node, Open MPI's libfabric (OFI) components abort in `MPI_Init` on Arrhenius (`free(): invalid pointer` in
+`libfabric.so`, called from `opal_common_ofi_fi_domain`). Disable them before `srun`, as
+`examples/arrhenius_mpi.sh` does automatically when the job has one node:
+
+```bash
+export OMPI_MCA_btl=^ofi OMPI_MCA_mtl=^ofi
+```
+
 If the run crashes in `MPI_Sendrecv` or `MPI_Alltoallv` (segmentation fault, `cuda` errors from UCX), the MPI is not
 handling device pointers. Tell me; staging through host memory is a small change.
 
@@ -141,7 +149,8 @@ Expected: the last line of `data/log.dat` (step 10 of the second run, t identica
 
 ### 3.3 Two nodes
 
-Repeat 3.1 with 8 GPUs on two nodes (`examples/arrhenius_mpi.sh`, `srun --mpi=pmix`). nz = 48 gives 6 planes per
+Repeat 3.1 with 8 GPUs on two nodes (`examples/arrhenius_mpi.sh`, `srun --mpi=pmix`). With more than one node the
+script keeps libfabric and sets `FI_PROVIDER=cxi` (Slingshot) and `FI_LOG_LEVEL=warn`; this has not been tested yet. nz = 48 gives 6 planes per
 GPU, still above the minimum of 3. The same agreement is expected.
 
 ## 4. Performance
