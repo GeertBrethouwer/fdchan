@@ -36,6 +36,7 @@
 #include "params.hpp"
 #include "psolve.hpp"
 #include "comm.hpp"
+#include "timer.hpp"
 
 namespace fd {
 
@@ -142,15 +143,13 @@ class Solver {
   std::vector<int> a2a_sc, a2a_sd, a2a_rc, a2a_rd;  // all-to-all counts and displacements (in reals)
   DArray<idx> d_sd, d_rd;
   DArray<int> d_cnt, d_nzr;
-  double t_comm = 0, dpdx_acc = 0;
+  double dpdx_acc = 0;
   XFFT xfft;
   ZFFT zfft;
   // state
   double time = 0, dt = 0, dpdx_step = 0;
   long step = 0;
   int W1 = 0, W2 = 0;
-  // timers (seconds)
-  double t_nl = 0, t_rhs = 0, t_p = 0, t_other = 0;
 
   explicit Solver(const Params& prm) : P(prm) {
     nx = P.nx; ny = P.ny; nzg = P.nz;
@@ -346,9 +345,9 @@ class Solver {
     ptranspose(ny, nz_, nkx_,
         [=] HD(idx j, int k, int i) -> cplx { return t1[(j * nz_ + k) * nkx_ + i]; },
         [=] HD(idx j, int k, int i, cplx val) { const int r = own[i]; sb[sd[r] + (j * cnt[r] + off[i]) * nz_ + k] = val; });
-    auto t0 = tick();
+    g_timer.tic(tm_a2a);
     g_comm.alltoallv(reinterpret_cast<real*>(sbuf.p), a2a_sc, a2a_sd, reinterpret_cast<real*>(rbuf.p), a2a_rc, a2a_rd);
-    t_comm += tick() - t0;
+    g_timer.toc(tm_a2a);
     pfor(idx(ny) * nkl_ * nzg_, [=] HD(idx m) {
       const int kg = int(m % nzg_);
       const idx r = m / nzg_;
@@ -368,9 +367,9 @@ class Solver {
       const int s = zown[kg];
       rb[rd[s] + r * nzr[s] + zoff[kg]] = t2[m];
     });
-    auto t0 = tick();
+    g_timer.tic(tm_a2a);
     g_comm.alltoallv(reinterpret_cast<real*>(rbuf.p), a2a_rc, a2a_rd, reinterpret_cast<real*>(sbuf.p), a2a_sc, a2a_sd);
-    t_comm += tick() - t0;
+    g_timer.toc(tm_a2a);
     ptranspose(ny, nkx_, nz_,
         [=] HD(idx j, int i, int k) -> cplx { const int r = own[i]; return sb[sd[r] + (j * cnt[r] + off[i]) * nz_ + k]; },
         [=] HD(idx j, int i, int k, cplx val) { t1[(j * nz_ + k) * nkx_ + i] = val; });
@@ -393,11 +392,11 @@ class Solver {
       sb[n] = f[(j * nz_ + k) * L + i];
     });
     const int up = (myrank + 1) % nrank, dn = (myrank - 1 + nrank) % nrank;
-    auto t0 = tick();
+    g_timer.tic(tm_halo);
     // my upper planes -> upper neighbour's lower halo; receive my lower halo from the lower neighbour
     g_comm.sendrecv(reinterpret_cast<const real*>(sb), 2 * part, up, reinterpret_cast<real*>(hal), dn, 11);
     g_comm.sendrecv(reinterpret_cast<const real*>(sb + part), 2 * part, dn, reinterpret_cast<real*>(hal + part), up, 12);
-    t_comm += tick() - t0;
+    g_timer.toc(tm_halo);
   }
 
   void print_setup() const {
@@ -430,29 +429,30 @@ class Solver {
     dpdx_step = 0;
     if (P.forcing == "cfr") reset_dpdx_accumulator();
     for (int s = 0; s < ns; ++s) {
-      auto t0 = tick();
+      g_timer.tic(tm_nl);
       nonlinear();
-      if (s == 0) choose_dt();
-      auto t1 = tick();
-      t_nl += t1 - t0;
+      g_timer.toc(tm_nl);
+      if (s == 0) {
+        g_timer.tic(tm_dt);
+        choose_dt();
+        g_timer.toc(tm_dt);
+      }
+      g_timer.tic(tm_rhs);
       rhs(gam[s] * dt, zet[s] * dt);
-      auto t2 = tick();
-      t_rhs += t2 - t1;
+      g_timer.toc(tm_rhs);
+      g_timer.tic(tm_p);
       project();
-      auto t3 = tick();
-      t_p += t3 - t2;
-      if (P.forcing == "cfr") cfr_correct();
-      t_other += tick() - t3;
+      g_timer.toc(tm_p);
+      if (P.forcing == "cfr") {
+        g_timer.tic(tm_cfr);
+        cfr_correct();
+        g_timer.toc(tm_cfr);
+      }
     }
     if (P.forcing == "cfr") dpdx_step = dpdx_acc / dt;
     else dpdx_step = P.dpdx;
     time += dt;
     ++step;
-  }
-
-  double tick() {
-    if (P.timing) sync();
-    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
   }
 
   YDev ydev(int d) const {

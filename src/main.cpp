@@ -103,6 +103,8 @@ int main(int argc, char** argv) {
   const std::string inp = argc > 1 ? argv[1] : "input.txt";
   Params P;
   P.read(inp);
+  g_timer.on = P.timing;
+  g_timer.sync_gpu = P.timing_sync;
 #ifdef FD_GPU
   {
     int ndev = 1, local = 0;
@@ -195,33 +197,53 @@ int main(int argc, char** argv) {
   auto wall = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(); };
   long n0 = S.step;
   bool go = true;
+  g_timer.start(P.data_dir);
   while (go) {
     if (S.step - n0 >= P.nstep || S.time >= P.tmax - 1e-12) break;
     if (P.fixed_dt && S.time + P.dt > P.tmax + 1e-12) break;
+    g_timer.tic(tm_rk);
     S.advance();
-    if (P.iout_log > 0 && S.step % P.iout_log == 0) log_line();
+    g_timer.toc(tm_rk);
+    if (P.iout_log > 0 && S.step % P.iout_log == 0) {
+      g_timer.tic(tm_log);
+      log_line();
+      g_timer.toc(tm_log);
+    }
+    g_timer.tic(tm_stats);
     if (P.iout_stats > 0 && S.step % P.iout_stats == 0 && S.time >= P.tstats_start) sample();
     if (P.iout_save_stats > 0 && S.step % P.iout_save_stats == 0) save_stats();
-    if (P.iout_restart > 0 && S.step % P.iout_restart == 0) write_restart(S, P.data_dir + "/restart.bin");
+    g_timer.toc(tm_stats);
+    if (P.iout_restart > 0 && S.step % P.iout_restart == 0) {
+      g_timer.tic(tm_io);
+      write_restart(S, P.data_dir + "/restart.bin");
+      g_timer.toc(tm_io);
+    }
     // the same wall-clock decision on all ranks
     go = g_comm.allmax(wall() < P.wall_time_max ? 0.0 : 1.0) == 0.0;
+    g_timer.step(S.step, S.time, S.dt);
   }
   sync();
   g_comm.barrier();
   const double tw = wall();
   const long ns = S.step - n0;
-  if (P.iout_log <= 0 || S.step % P.iout_log != 0) log_line();
+  if (P.iout_log <= 0 || S.step % P.iout_log != 0) {
+    g_timer.tic(tm_log);
+    log_line();
+    g_timer.toc(tm_log);
+  }
+  g_timer.tic(tm_stats);
   save_stats();
+  g_timer.toc(tm_stats);
+  g_timer.tic(tm_io);
   write_restart(S, P.data_dir + "/restart.bin");
+  g_timer.toc(tm_io);
   if (root) {
     std::fclose(lg);
     std::printf("%ld steps in %.3f s: %.4e s per step, %.3e s per step and grid point (nx*ny*nz)\n", ns, tw,
                 tw / std::max(ns, 1L), tw / std::max(ns, 1L) / (double(S.nx) * S.ny * S.nzg));
-    if (P.timing && ns > 0)
-      std::printf("per step (rank 0): nonlinear+FFT %.3e s, rhs %.3e s, pressure %.3e s, other %.3e s, of which "
-                  "communication %.3e s\n",
-                  S.t_nl / ns, S.t_rhs / ns, S.t_p / ns, S.t_other / ns, S.t_comm / ns);
   }
+  // the time loop of the report includes the final output (log line, statistics, restart file)
+  g_timer.report(ns, double(S.nx) * S.ny * S.nzg, P.data_dir);
   g_comm.finalize();
   return 0;
 }

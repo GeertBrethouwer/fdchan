@@ -46,7 +46,8 @@ struct Params {
   int iout_log = 100, iout_stats = 0, iout_save_stats = 0, iout_restart = 0;
   double tstats_start = 0;
   int mode_log_kx = 1;
-  bool timing = false;
+  bool timing = false;       // timers: report at the end (timing_report.txt), time per step in timing_steps.dat
+  bool timing_sync = true;   // timers wait for the GPU (exact attribution, a little overhead)
   bool fuse_y = true;  // FDCHAN: y-derivatives formed inside the kernels that use them (one thread per line)
   // CPU only
   int nthreads = 0;
@@ -91,7 +92,7 @@ struct Params {
     I("mode_kz", mode_kz); S("restart_file", restart_file); S("mode_file", mode_file); B("reset_time", reset_time);
     S("data_dir", data_dir); I("iout_log", iout_log); I("iout_stats", iout_stats);
     I("iout_save_stats", iout_save_stats); I("iout_restart", iout_restart); D("tstats_start", tstats_start);
-    I("mode_log_kx", mode_log_kx); B("timing", timing); B("fuse_y", fuse_y); I("nthreads", nthreads);
+    I("mode_log_kx", mode_log_kx); B("timing", timing); B("timing_sync", timing_sync); B("fuse_y", fuse_y); I("nthreads", nthreads);
     for (auto& p : kv) std::fprintf(stderr, "warning: unknown input item '%s'\n", p.first.c_str());
     if (nx % 2) fatal("nx must be even");
     if (fd_order % 2 || fd_order < 2 || fd_order > 8) fatal("fd_order must be 2, 4, 6 or 8");
@@ -109,6 +110,7 @@ struct Params {
     std::printf("time      nstep = %ld, tmax = %g, fixed_dt = %d, dt = %g, cfl = %g, cfl_visc = %g, rk_stages = %d\n",
                 nstep, tmax, int(fixed_dt), dt, cfl, cfl_visc, rk_stages);
     std::printf("init      %s, amp = %g\n", init_type.c_str(), init_amp);
+    if (timing) std::printf("timing    on%s (timing_report.txt, timing_steps.dat)\n", timing_sync ? ", GPU-synchronised" : "");
   }
 };
 

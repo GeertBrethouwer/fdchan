@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "backend.hpp"
+#include "timer.hpp"
 
 #if defined(FD_CUDA)
 #include <cufft.h>
@@ -164,6 +165,23 @@ class XFFT {
   }
   // real (line stride ld) -> complex (line stride lp), in place
   void forward(real* buf) {
+    g_timer.tic(tm_xfft);
+    forward_(buf);
+    g_timer.toc(tm_xfft);
+  }
+  void backward(real* buf) {
+    g_timer.tic(tm_xfft);
+    backward_(buf);
+    g_timer.toc(tm_xfft);
+  }
+  ~XFFT() {
+#ifdef FD_GPU
+    if (mx) { fftDestroy(pf_); fftDestroy(pb_); }
+#endif
+  }
+
+ private:
+  void forward_(real* buf) {
 #ifdef FD_GPU
     if (fftExecR2C(pf_, (fftReal*)buf, (fftComplex*)buf) != FFT_SUCCESS) fatal("FFT exec (x, forward)");
 #else
@@ -178,7 +196,7 @@ class XFFT {
 #endif
   }
   // complex (line stride lp) -> real (line stride ld), in place; Im of bin 0 (and bin mx/2) ignored
-  void backward(real* buf) {
+  void backward_(real* buf) {
 #ifdef FD_GPU
     if (fftExecC2R(pb_, (fftComplex*)buf, (fftReal*)buf) != FFT_SUCCESS) fatal("FFT exec (x, backward)");
 #else
@@ -195,13 +213,6 @@ class XFFT {
     });
 #endif
   }
-  ~XFFT() {
-#ifdef FD_GPU
-    if (mx) { fftDestroy(pf_); fftDestroy(pb_); }
-#endif
-  }
-
- private:
 #ifdef FD_GPU
   fftHandle pf_, pb_;
 #else
@@ -237,6 +248,18 @@ class ZFFT {
 #endif
   }
   void exec(cplx* buf, int sign) {
+    g_timer.tic(tm_zfft);
+    exec_(buf, sign);
+    g_timer.toc(tm_zfft);
+  }
+  ~ZFFT() {
+#ifdef FD_GPU
+    if (nz) fftDestroy(p_);
+#endif
+  }
+
+ private:
+  void exec_(cplx* buf, int sign) {
 #ifdef FD_GPU
     if (fftExecC2C(p_, (fftComplex*)buf, (fftComplex*)buf, sign < 0 ? FFT_FORWARD : FFT_INVERSE) != FFT_SUCCESS)
       fatal("FFT exec (z)");
@@ -257,13 +280,6 @@ class ZFFT {
     });
 #endif
   }
-  ~ZFFT() {
-#ifdef FD_GPU
-    if (nz) fftDestroy(p_);
-#endif
-  }
-
- private:
 #ifdef FD_GPU
   fftHandle p_;
 #else

@@ -155,12 +155,14 @@ GPU, still above the minimum of 3. The same agreement is expected.
 
 ## 4. Performance
 
-All runs with `timing = 1` in the input: stdout then shows the time per step split into nonlinear terms with
-FFTs, right-hand side, pressure, other, and the communication contained in them (rank 0). Use 200 steps and
-`iout_log = 50`, `iout_stats = 0`, `iout_restart = 0`.
+All runs with `timing = 1` in the input: at the end FDCHAN prints the same kind of timing report as HiCHAN
+(also in `data/timing_report.txt`): the time in each part (nonlinear terms, right-hand side, pressure, x- and
+z-FFTs, all-to-alls, halo exchanges, output) with min/mean/max over the ranks, and the distribution of the time
+per step; `data/timing_steps.dat` has one line per step. Use 200 steps and `iout_log = 50`, `iout_stats = 0`,
+`iout_restart = 0`.
 
-`timing = 1` synchronises the GPU around every part; for the final number of a configuration run once more with
-`timing = 0`.
+`timing_sync = 1` (default) synchronises the GPU around every part; for the final number of a configuration run
+once more with `timing = 0`, or with `timing_sync = 0` (the time per step is then exact, the parts less so).
 
 Run B and F1 a second time with `fuse_y = 0`. The default `fuse_y = 1` forms the y-derivatives inside the kernels
 that use them; it reads and writes less memory but uses one GPU thread per y-line instead of one per point. Both
@@ -223,7 +225,7 @@ grid without scalar (9 transforms with two transposes each). With an effective 5
 
 So when HiCHAN is limited by the network, FDCHAN should be several times faster per step (about 5–10× for F1,
 3–7× for F2). Treat these as correct to a factor of two at best; the all-to-all throughput on Arrhenius and the
-efficiency of the untuned kernels are the main unknowns. If the `communication` part of FDCHAN's timing line is
+efficiency of the untuned kernels are the main unknowns. If the `communication` line of FDCHAN's timing report is
 small, the kernels are the limit and there is room for tuning.
 
 ## 6. What to send back
@@ -231,5 +233,5 @@ small, the kernels are the limit and there is room for tuning.
 - compiler errors from step 1, if any;
 - 2.1 and 2.2: the last lines of stdout and the `fit.py` result;
 - 2.3, 3.1, 3.2: the last line of each `log.dat` (or the `diff`);
-- 4 and 5: the timing lines of stdout (time per step and its split), the `dt` column after 100 steps, and the
-  memory line printed at start-up; for HiCHAN `timing_report.txt`.
+- 4 and 5: `timing_report.txt` of both codes, the `dt` column after 100 steps, and the memory line FDCHAN prints
+  at start-up.

@@ -43,12 +43,21 @@ struct Comm {
   }
   void allsum(std::vector<double>& x) const { allsum(x.data(), int(x.size())); }
   double allsum(double x) const { allsum(&x, 1); return x; }
-  double allmax(double x) const {
+  void allmax(double* x, int n) const {
 #ifdef FD_MPI
-    if (size > 1) MPI_Allreduce(MPI_IN_PLACE, &x, 1, MPI_DOUBLE, MPI_MAX, comm);
+    if (size > 1) MPI_Allreduce(MPI_IN_PLACE, x, n, MPI_DOUBLE, MPI_MAX, comm);
+#else
+    (void)x; (void)n;
 #endif
-    return x;
   }
+  void allmin(double* x, int n) const {
+#ifdef FD_MPI
+    if (size > 1) MPI_Allreduce(MPI_IN_PLACE, x, n, MPI_DOUBLE, MPI_MIN, comm);
+#else
+    (void)x; (void)n;
+#endif
+  }
+  double allmax(double x) const { allmax(&x, 1); return x; }
   void barrier() const {
 #ifdef FD_MPI
     MPI_Barrier(comm);

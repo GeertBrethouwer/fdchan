@@ -57,7 +57,8 @@ mpirun -n 8 build/fdchan_mpi input.txt         # 8 ranks (GPUs), z-slabs
 
 With MPI each rank picks GPU (node-local rank) mod (GPUs per node). The z-slabs need at least p/2 = 3 planes per
 rank (6th order); for efficiency use at least ~16 (nz/P ≥ 16). `nx/2` x-modes are distributed over the ranks for
-the pressure solve. With `timing = 1` the time spent in communication is printed.
+the pressure solve. With `timing = 1` the time in each part of the code, communication included, is reported
+(see Output).
 
 The input is a text file with `key = value` lines (`!` or `#` start a comment); unknown keys are reported.
 
@@ -82,7 +83,7 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `data_dir` | data | output directory |
 | `iout_log`, `iout_stats`, `iout_save_stats`, `iout_restart`, `tstats_start` | 100, 0, 0, 0, 0 | output intervals in steps |
 | `mode_log_kx` | 1 | kx index of the mode whose v-energy is logged |
-| `timing` | false | per-part timers (synchronises the GPU) |
+| `timing`, `timing_sync` | false, true | timers as in HiCHAN: `timing_report.txt` and `timing_steps.dat` (see Output). `timing_sync` makes every timer wait for the GPU (exact attribution of the time to the parts) |
 | `fuse_y` | true | form the y-derivatives inside the kernels that use them (one thread per y-line, no derivative arrays written and read back; as x3d2's fused transport kernels). `false`: separate derivative and pointwise kernels. Same results to the last bit |
 | `nthreads` | all cores | CPU build only (threads per rank) |
 
@@ -97,6 +98,21 @@ the peaks of the rms and shear-stress profiles in wall units.
   included), fluctuation energy, v-energy of mode `mode_log_kx`.
 * `stats.dat`: time averages of U, V, W, ⟨u′u′⟩, ⟨v′v′⟩, ⟨w′w′⟩, ⟨u′v′⟩ (Parseval in x, averages over z).
 * `restart.bin`: the spectral fields (kx, z, y) and the time; written at the end and every `iout_restart` steps.
+* With `timing = 1` (as HiCHAN's `timing = .true.`):
+  * `timing_report.txt` (also printed at the end of the run): the wall-clock time spent in each part of the
+    code: RK steps, nonlinear terms, time-step limit, right-hand side, pressure, flow-rate correction, x- and
+    z-FFTs, all-to-all transposes, halo exchanges, log, statistics and restart files, and their sum of
+    communication. For each part it gives the number of calls, the min/mean/max over the MPI ranks (load
+    imbalance), the percentage of the time loop and the time per step. It also gives the distribution of the
+    time per step (min/median/mean/max), the number of steps slower than 2× the median, and the 10 slowest steps
+    with their breakdown.
+  * `timing_steps.dat`: one line per time step. Columns: step, t, Δt, the wall-clock time of the step (slowest
+    rank, fastest rank, mean), and the time of the step spent in the nonlinear terms, pressure, all-to-alls, halo
+    exchanges and output (max over the ranks).
+  * `timing_sync = 1` (default) makes every timer wait for the GPU, so that asynchronous GPU work is attributed
+    to the right part. This removes some overlap of kernel launches. With `timing_sync = 0` the parts are less
+    exact, but the time per step stays exact. The results do not depend on the timing settings (checked bit for
+    bit on the CPU, 1 and 4 ranks).
 
 ## Examples
 
