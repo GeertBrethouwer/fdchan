@@ -342,18 +342,22 @@ class Solver {
     const idx *sd = d_sd.p, *rd = d_rd.p;
     cplx *sb = sbuf.p, *rb = rbuf.p;
     // per y-row a (z, kx) -> (kx, z) transpose: tiled, so that reads and writes are both coalesced
+    g_timer.tic(tm_pack);
     ptranspose(ny, nz_, nkx_,
         [=] HD(idx j, int k, int i) -> cplx { return t1[(j * nz_ + k) * nkx_ + i]; },
         [=] HD(idx j, int k, int i, cplx val) { const int r = own[i]; sb[sd[r] + (j * cnt[r] + off[i]) * nz_ + k] = val; });
+    g_timer.toc(tm_pack);
     g_timer.tic(tm_a2a);
     g_comm.alltoallv(reinterpret_cast<real*>(sbuf.p), a2a_sc, a2a_sd, reinterpret_cast<real*>(rbuf.p), a2a_rc, a2a_rd);
     g_timer.toc(tm_a2a);
+    g_timer.tic(tm_pack);
     pfor(idx(ny) * nkl_ * nzg_, [=] HD(idx m) {
       const int kg = int(m % nzg_);
       const idx r = m / nzg_;
       const int s = zown[kg];
       t2[m] = rb[rd[s] + r * nzr[s] + zoff[kg]];
     });
+    g_timer.toc(tm_pack);
   }
   // inverse of transpose_to_kx
   void transpose_to_z(const cplx* t2, cplx* t1) {
@@ -361,18 +365,22 @@ class Solver {
     const int *own = d_kxown.p, *off = d_kxoff.p, *cnt = d_cnt.p, *zown = d_zown.p, *zoff = d_zoff.p, *nzr = d_nzr.p;
     const idx *sd = d_sd.p, *rd = d_rd.p;
     cplx *sb = sbuf.p, *rb = rbuf.p;
+    g_timer.tic(tm_pack);
     pfor(idx(ny) * nkl_ * nzg_, [=] HD(idx m) {
       const int kg = int(m % nzg_);
       const idx r = m / nzg_;
       const int s = zown[kg];
       rb[rd[s] + r * nzr[s] + zoff[kg]] = t2[m];
     });
+    g_timer.toc(tm_pack);
     g_timer.tic(tm_a2a);
     g_comm.alltoallv(reinterpret_cast<real*>(rbuf.p), a2a_rc, a2a_rd, reinterpret_cast<real*>(sbuf.p), a2a_sc, a2a_sd);
     g_timer.toc(tm_a2a);
+    g_timer.tic(tm_pack);
     ptranspose(ny, nkx_, nz_,
         [=] HD(idx j, int i, int k) -> cplx { const int r = own[i]; return sb[sd[r] + (j * cnt[r] + off[i]) * nz_ + k]; },
         [=] HD(idx j, int i, int k, cplx val) { t1[(j * nz_ + k) * nkx_ + i] = val; });
+    g_timer.toc(tm_pack);
   }
   // fill the halo buffer of f (line length L, first W entries of each line) from the neighbouring ranks
   void halo(const cplx* f, idx L, cplx* hal) {
@@ -703,6 +711,7 @@ class Solver {
     const YDev D = ydev(0);
     const ZSt z = zs;
     cplx *t1 = T1.p, *t2 = T2.p;
+    g_timer.tic(tm_p_rhs);
     halo(Rz, lp_, hbA.p);
     const cplx* hR = hbA.p;
     // right-hand side  (B1 E r_y)_j - (A1 c)_j,  c = -(i kx r_x + D1z r_z) at interior points, 0 at the walls
@@ -733,12 +742,16 @@ class Solver {
       }
       t1[n] = s;
     });
+    g_timer.toc(tm_p_rhs);
     // (kx, z local, y) -> (z global, kx local, y): all-to-all to the kx-slabs
     transpose_to_kx(t1, t2);
     zfft.exec(T2.p, -1);
+    g_timer.tic(tm_p_lu);
     solve_columns();
+    g_timer.toc(tm_p_lu);
     zfft.exec(T2.p, +1);
     transpose_to_z(t2, t1);
+    g_timer.tic(tm_p_grad);
     halo(t1, nkx_, hbB.p);
     const cplx* hP = hbB.p;
     ydiff(0, T1.p, T2.p);  // D1y phi
@@ -781,6 +794,7 @@ class Solver {
       const double m0 = prof[j] / nzg_, mn = nyq ? prof[ny_ + j] / nzg_ : 0.0;
       V[(idx(j) * nz_ + k) * nkx_].re -= real(m0 + (((k + z0_) % 2) ? -mn : mn));
     });
+    g_timer.toc(tm_p_grad);
   }
 
   template <int KK>

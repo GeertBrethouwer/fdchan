@@ -22,7 +22,9 @@ namespace fd {
 enum TimerId {
   tm_loop, tm_rk, tm_nl, tm_dt, tm_rhs, tm_p, tm_cfr,
   tm_xfft, tm_zfft, tm_a2a, tm_halo,
-  tm_log, tm_stats, tm_io, NTM
+  tm_log, tm_stats, tm_io,
+  tm_p_rhs, tm_pack, tm_p_lu, tm_p_grad,  // parts of the pressure step
+  NTM
 };
 
 struct Timer {
@@ -67,6 +69,8 @@ struct Timer {
   void start(const std::string& dir) {
     if (!on) return;
     sync();
+    // count only the time loop (not the set-up, the initial projection and the first log line)
+    for (int i = 0; i < NTM; ++i) { ttot[i] = 0; ncall[i] = 0; }
     if (g_comm.root()) {
       fs = std::fopen((dir + "/timing_steps.dat").c_str(), "w");
       if (!fs) fatal("cannot open timing_steps.dat");
@@ -143,13 +147,20 @@ struct Timer {
         {"    nonlinear terms (incl. x-FFTs, halos)", tm_nl},
         {"    time-step limit (CFL, MPI_Allreduce)", tm_dt},
         {"    right-hand side (viscous terms, RK)", tm_rhs},
-        {"    pressure (z-FFT, all-to-alls, LU)", tm_p},
+        {"    pressure", tm_p},
+        {"      right-hand side (divergence, halo)", tm_p_rhs},
+        {"      packing for the all-to-alls", tm_pack},
+        {np == 1 ? "      all-to-all transposes (local copy)"
+                 : nccl ? "      all-to-all transposes (NCCL)" : "      all-to-all transposes (MPI)", tm_a2a},
+        {"      z-FFTs", tm_zfft},
+        {"      banded LU solves (phi, D1 phi)", tm_p_lu},
+        {"      gradient correction (halo, D1y phi)", tm_p_grad},
+        {"      rest of the pressure", -3},
         {"    flow-rate correction (cfr)", tm_cfr},
         {"    rest of the RK steps", -1},
         {"x-FFTs (all calls)", tm_xfft},
-        {"z-FFTs (all calls)", tm_zfft},
-        {nccl ? "all-to-all transposes (NCCL, all calls)" : "all-to-all transposes (MPI, all calls)", tm_a2a},
-        {nccl ? "halo exchanges (NCCL, all calls)" : "halo exchanges (MPI, all calls)", tm_halo},
+        {np == 1 ? "halo exchanges (local copies, all calls)"
+                 : nccl ? "halo exchanges (NCCL, all calls)" : "halo exchanges (MPI, all calls)", tm_halo},
         {"log output (diagnostics, log.dat)", tm_log},
         {"statistics (sample, write)", tm_stats},
         {"restart files", tm_io},
@@ -169,16 +180,18 @@ struct Timer {
           std::fprintf(u, " %-43s%8ld%11.3f%11.3f%11.3f%8.1f%11.3f\n", r.name, ncall[r.id], tmin[r.id], m, tmax[r.id],
                        100 * m / tloop, 1000 * m / ns);
         } else {
-          const double s = r.id == -1
-              ? (tsum[tm_rk] - tsum[tm_nl] - tsum[tm_dt] - tsum[tm_rhs] - tsum[tm_p] - tsum[tm_cfr]) / np
-              : (tsum[tm_loop] - tsum[tm_rk] - tsum[tm_log] - tsum[tm_stats] - tsum[tm_io]) / np;
+          const double s =
+              r.id == -1 ? (tsum[tm_rk] - tsum[tm_nl] - tsum[tm_dt] - tsum[tm_rhs] - tsum[tm_p] - tsum[tm_cfr]) / np
+              : r.id == -3 ? (tsum[tm_p] - tsum[tm_p_rhs] - tsum[tm_pack] - tsum[tm_a2a] - tsum[tm_zfft] - tsum[tm_p_lu] -
+                              tsum[tm_p_grad]) / np
+                           : (tsum[tm_loop] - tsum[tm_rk] - tsum[tm_log] - tsum[tm_stats] - tsum[tm_io]) / np;
           std::fprintf(u, " %-43s%8s%11s%11.3f%11s%8.1f%11.3f\n", r.name, "", "", s, "", 100 * s / tloop, 1000 * s / ns);
         }
       }
       const double comm = (tsum[tm_a2a] + tsum[tm_halo]) / np;
       std::fprintf(u, " %-43s%8s%11s%11.3f%11s%8.1f%11.3f\n", "communication (all-to-alls + halos)", "", "", comm, "",
                    100 * comm / tloop, 1000 * comm / ns);
-      std::fprintf(u, " (FFTs, all-to-alls and halos include the calls in the diagnostics and the initial projection)\n");
+      std::fprintf(u, " (x-FFTs and halo exchanges include the calls in the diagnostics of the log output)\n");
       if (!sync_gpu) std::fprintf(u, " (timing_sync = 0: GPU work may be attributed to a later part)\n");
     }
     // time per step: distribution and spikes

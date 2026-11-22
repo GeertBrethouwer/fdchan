@@ -106,9 +106,10 @@ the peaks of the rms and shear-stress profiles in wall units.
 * `restart.bin`: the spectral fields (kx, z, y) and the time; written at the end and every `iout_restart` steps.
 * With `timing = 1` (as HiCHAN's `timing = .true.`):
   * `timing_report.txt` (also printed at the end of the run): the wall-clock time spent in each part of the
-    code: RK steps, nonlinear terms, time-step limit, right-hand side, pressure, flow-rate correction, x- and
-    z-FFTs, all-to-all transposes, halo exchanges, log, statistics and restart files, and their sum of
-    communication. For each part it gives the number of calls, the min/mean/max over the MPI ranks (load
+    time loop: RK steps, nonlinear terms, time-step limit, right-hand side, pressure (split into its
+    right-hand side, packing for the all-to-alls, all-to-alls, z-FFTs, banded LU solves and gradient
+    correction), flow-rate correction, x-FFTs, halo exchanges, log, statistics and restart files, and the sum of
+    the communication. For each part it gives the number of calls, the min/mean/max over the MPI ranks (load
     imbalance), the percentage of the time loop and the time per step. It also gives the distribution of the
     time per step (min/median/mean/max), the number of steps slower than 2× the median, and the 10 slowest steps
     with their breakdown.
