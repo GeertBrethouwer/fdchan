@@ -75,9 +75,19 @@ LIBS = -lpthread
 endif
 EXE = build/fdchan$(if $(filter 1,$(MPI)),_mpi,)
 
-$(EXE): $(SRC) $(HDR)
+# rebuild when the compiler or the options change (e.g. NCCL=1 added for an existing EXE), not only the sources
+FLAGS_STAMP = build/.flags.$(notdir $(EXE))
+BUILD_CMD = $(CXX) $(CXXFLAGS) $(DEFS) $(LIBS)
+
+$(EXE): $(SRC) $(HDR) $(FLAGS_STAMP)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(DEFS) $(SRC) -o $@ $(LIBS)
+
+$(FLAGS_STAMP): FORCE
+	@mkdir -p build
+	@echo '$(BUILD_CMD)' | cmp -s - $@ || echo '$(BUILD_CMD)' > $@
+
+FORCE:
 
 build/test_ops: tests/test_ops.cpp $(HDR)
 	@mkdir -p build
@@ -89,4 +99,4 @@ test: build/test_ops
 clean:
 	rm -rf build
 
-.PHONY: test clean
+.PHONY: test clean FORCE

@@ -135,8 +135,9 @@ struct Timer {
     std::FILE* fr = std::fopen((dir + "/timing_report.txt").c_str(), "w");
     std::FILE* out[2] = {stdout, fr};
     const double tloop = std::max(tsum[tm_loop] / np, 1e-30), ns = double(std::max(nsteps, 1L));
+    const bool nccl = g_comm.use_nccl;
     struct Row { const char* name; int id; };
-    static const Row rows[] = {
+    const Row rows[] = {
         {"time loop (total)", tm_loop},
         {"  RK steps", tm_rk},
         {"    nonlinear terms (incl. x-FFTs, halos)", tm_nl},
@@ -147,8 +148,8 @@ struct Timer {
         {"    rest of the RK steps", -1},
         {"x-FFTs (all calls)", tm_xfft},
         {"z-FFTs (all calls)", tm_zfft},
-        {"all-to-all transposes (MPI, all calls)", tm_a2a},
-        {"halo exchanges (MPI, all calls)", tm_halo},
+        {nccl ? "all-to-all transposes (NCCL, all calls)" : "all-to-all transposes (MPI, all calls)", tm_a2a},
+        {nccl ? "halo exchanges (NCCL, all calls)" : "halo exchanges (MPI, all calls)", tm_halo},
         {"log output (diagnostics, log.dat)", tm_log},
         {"statistics (sample, write)", tm_stats},
         {"restart files", tm_io},
@@ -158,8 +159,8 @@ struct Timer {
     const char* dash = "------------------------------------------------------------------------------------------\n";
     for (std::FILE* u : out) {
       if (!u) continue;
-      std::fprintf(u, "%s FDCHAN timing report: %ld time steps, %d MPI rank(s), timing_sync = %d\n", line, nsteps, np,
-                   int(sync_gpu));
+      std::fprintf(u, "%s FDCHAN timing report: %ld time steps, %d MPI rank(s), timing_sync = %d, halos and "
+                   "all-to-alls with %s\n", line, nsteps, np, int(sync_gpu), np == 1 ? "local copies" : nccl ? "NCCL" : "MPI");
       std::fprintf(u, " wall-clock times in s; min/mean/max over the ranks; %% of the mean time-loop time\n%s", dash);
       std::fprintf(u, "%-44s%8s%11s%11s%11s%8s%11s\n", " part of the code", "calls", "min", "mean", "max", "%", "ms/step");
       for (const Row& r : rows) {
