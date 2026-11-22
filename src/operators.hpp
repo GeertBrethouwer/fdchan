@@ -180,6 +180,17 @@ struct YDeriv {
   // dense matrix of A^-1 B (tests, small n)
 };
 
+// x^q and d^der/dx^der of x^q, in long double. Plain host functions, not lambdas: C++17 lambdas are implicitly
+// constexpr, and with nvcc --expt-relaxed-constexpr they are also compiled for the device, where long double is
+// double (warning #20208-D). These run only on the host, in the set-up.
+inline long double pow_ld(long double x, int q) { long double p = 1; for (int i = 0; i < q; ++i) p *= x; return p; }
+inline long double dpow_ld(long double x, int q, int der) {
+  if (q < der) return 0;
+  long double c = 1;
+  for (int i = 0; i < der; ++i) c *= (q - i);
+  return c * pow_ld(x, q - der);
+}
+
 // Solve for one row: unknown A off-diagonals at the indices `ia`, B weights on `ib` (contiguous)
 inline void compact_row(const std::vector<double>& y, int j, int der, const std::vector<int>& ia,
                         const std::vector<int>& ib, std::vector<double>& alpha, std::vector<double>& beta) {
@@ -188,18 +199,10 @@ inline void compact_row(const std::vector<double>& y, int j, int der, const std:
   const int jn = (j + 1 < int(y.size())) ? j + 1 : j - 1;
   const double h = std::abs(y[size_t(jn)] - y[size_t(j)]);
   std::vector<long double> M(static_cast<size_t>(Q * Q)), r(static_cast<size_t>(Q));
-  auto pw = [](long double x, int q) { long double p = 1; for (int i = 0; i < q; ++i) p *= x; return p; };
-  // d^der/dx^der of x^q at x
-  auto dp = [&](long double x, int q) -> long double {
-    if (q < der) return 0;
-    long double c = 1;
-    for (int i = 0; i < der; ++i) c *= (q - i);
-    return c * pw(x, q - der);
-  };
   for (int q = 0; q < Q; ++q) {
-    for (int a = 0; a < na; ++a) M[size_t(q * Q + a)] = -dp((y[size_t(ia[size_t(a)])] - y[size_t(j)]) / h, q);
-    for (int b = 0; b < nb; ++b) M[size_t(q * Q + na + b)] = pw((y[size_t(ib[size_t(b)])] - y[size_t(j)]) / h, q);
-    r[size_t(q)] = dp(0.0L, q);
+    for (int a = 0; a < na; ++a) M[size_t(q * Q + a)] = -dpow_ld((y[size_t(ia[size_t(a)])] - y[size_t(j)]) / h, q, der);
+    for (int b = 0; b < nb; ++b) M[size_t(q * Q + na + b)] = pow_ld((y[size_t(ib[size_t(b)])] - y[size_t(j)]) / h, q);
+    r[size_t(q)] = dpow_ld(0.0L, q, der);
   }
   // Gaussian elimination with partial pivoting
   for (int k = 0; k < Q; ++k) {
@@ -222,7 +225,7 @@ inline void compact_row(const std::vector<double>& y, int j, int der, const std:
   alpha.assign(size_t(na), 0.0);
   beta.assign(size_t(nb), 0.0);
   for (int a = 0; a < na; ++a) alpha[size_t(a)] = double(r[size_t(a)]);
-  for (int b = 0; b < nb; ++b) beta[size_t(b)] = double(r[size_t(na + b)] / pw(h, der));
+  for (int b = 0; b < nb; ++b) beta[size_t(b)] = double(r[size_t(na + b)] / pow_ld(h, der));
 }
 
 // Compact schemes, rows given for the bottom wall (the top wall is mirrored). A is tridiagonal.
