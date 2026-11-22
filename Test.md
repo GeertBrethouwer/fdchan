@@ -136,12 +136,18 @@ On one node, Open MPI's libfabric (OFI) components abort in `MPI_Init` on Arrhen
 export OMPI_MCA_btl=^ofi OMPI_MCA_mtl=^ofi
 ```
 
-With `NCCL=1` the halo exchanges and all-to-alls use NCCL. On one node NCCL's network plugin must be switched off
-(it fails on Arrhenius as for HiCHAN); the job script does this:
+With `NCCL=1` the halo exchanges and all-to-alls use NCCL. On one node NCCL's libfabric network plugin must be
+switched off: it fails on Arrhenius (`NET/OFI Couldn't create domain`, then `Failed to initialize any NET plugin`
+and `ncclCommInitRank: invalid usage`). The site sets `NCCL_NET_PLUGIN=.../libnccl-net-ofi.so` and
+`NCCL_NET="AWS Libfabric"` again in every task, after `srun` has copied the job's environment, so `export` in the job
+script has no effect. Set them on the `srun` command line instead, as `examples/arrhenius_mpi.sh` does:
 
 ```bash
-export NCCL_NET_PLUGIN=none NCCL_NET=Socket NCCL_DEBUG=WARN
+srun --mpi=pmix env NCCL_NET_PLUGIN=none NCCL_NET=Socket $HOME/fdchan/build/fdchan_gpu_mpi input.txt
 ```
+
+Inside the node the GPUs still communicate over NVLink (Socket is only NCCL's transport between nodes). To see
+what a task gets: `srun -n 1 env NCCL_NET_PLUGIN=none NCCL_NET=Socket bash -c 'env | grep ^NCCL_NET'`.
 
 A first 4-GPU run (about 1e9 points) with the MPI path spent 9.3 of 10.5 s per step in the all-to-alls (1–2 GB/s
 per GPU). With NCCL the `all-to-all transposes` line of the timing report should drop to well under 0.1 s per
