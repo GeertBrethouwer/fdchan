@@ -89,10 +89,16 @@ $(FLAGS_STAMP): FORCE
 
 FORCE:
 
-# NCCL check across GPUs and nodes (tools/nccl_check.cu): make GPU=cuda MPI=1 NCCL=1 MPICXX=mpicxx build/nccl_check
-build/nccl_check: tools/nccl_check.cu $(FLAGS_STAMP)
+# checks across GPUs and nodes (examples/arrhenius_nccl_test.sh):
+#   make GPU=cuda NCCL=1 build/nccl_check          NCCL without MPI (tools/nccl_check.cu)
+#   make MPI=1 MPICXX=mpicxx build/mpi_check         MPI alone (tools/mpi_check.cpp)
+build/nccl_check: tools/nccl_check.cu
 	@mkdir -p build
-	$(CXX) $(CXXFLAGS) tools/nccl_check.cu -o $@ $(LIBS)
+	$(CXX) $(CXXFLAGS) $(NCCL_CFLAGS) tools/nccl_check.cu -o $@ $(LIBS) $(NCCL_LFLAGS) $(NCCL_LIB)
+
+build/mpi_check: tools/mpi_check.cpp
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) tools/mpi_check.cpp -o $@ $(LIBS)
 
 build/test_ops: tests/test_ops.cpp $(HDR)
 	@mkdir -p build
