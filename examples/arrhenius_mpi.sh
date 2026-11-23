@@ -22,8 +22,8 @@ module load GPU/buildenv-nvhpc/25.9-cu13.0
 # - one node: shared memory only. Open MPI's libfabric (OFI) components abort in MPI_Init on Arrhenius
 #   ("free(): invalid pointer" in libfabric.so, called from opal_common_ofi_fi_domain), so disable them;
 #   GPU buffers then go through the smcuda BTL.
-# - several nodes: libfabric with the Slingshot provider (cxi). Not yet tested: if MPI_Init still fails,
-#   the FI_LOG_LEVEL=warn output says why; ask NSC which MPI to use for multi-node GPU jobs.
+# - several nodes: the site's Open MPI settings (libfabric, Slingshot provider cxi). Tested on two nodes with
+#   examples/arrhenius_nccl_test.sh: works; with the libfabric components off (TCP only) MPI_Init fails.
 #
 # NCCL: inside a node it uses NVLink and needs no network plugin. Its libfabric (OFI) plugin (AWS_OFI_NCCL) fails
 # on Arrhenius ("NET/OFI Couldn't create domain" -> "Failed to initialize any NET plugin" -> ncclCommInitRank
@@ -31,8 +31,9 @@ module load GPU/buildenv-nvhpc/25.9-cu13.0
 # between nodes; the GPUs of the node still use NVLink). The site sets NCCL_NET_PLUGIN=.../libnccl-net-ofi.so
 # and NCCL_NET="AWS Libfabric" again in every task, after srun has copied this environment, so exporting them
 # here is not enough: they are set on the srun command line with env (NCCL_TASK_ENV below).
-# Between nodes NCCL needs a working plugin for Slingshot (ask NSC); NCCL_NET=Socket works but is slow,
-# otherwise set comm_backend = mpi in input.txt. NCCL_DEBUG=WARN prints the reason of a failure.
+# Between nodes the site's settings are used (AWS OFI plugin, provider cxi, one Slingshot NIC per GPU): tested on
+# two nodes with examples/arrhenius_nccl_test.sh, about 21 GB/s per GPU between the nodes (NCCL_NET=Socket:
+# 1.7 GB/s, never use it on several nodes). NCCL_DEBUG=WARN prints the reason of a failure.
 NNODES=${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}
 export NCCL_DEBUG=WARN
 if [ "$NNODES" -eq 1 ]; then

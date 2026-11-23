@@ -168,8 +168,10 @@ Expected: the last line of `data/log.dat` (step 10 of the second run, t identica
 ### 3.3 Two nodes
 
 Repeat 3.1 with 8 GPUs on two nodes (`examples/arrhenius_mpi.sh`, `srun --mpi=pmix`). With more than one node the
-script keeps libfabric and sets `FI_PROVIDER=cxi` (Slingshot) and `FI_LOG_LEVEL=warn`; this has not been tested yet. nz = 48 gives 6 planes per
-GPU, still above the minimum of 3. The same agreement is expected.
+script keeps the site's MPI and NCCL settings (libfabric with the Slingshot provider `cxi`). `examples/arrhenius_nccl_test.sh`
+checks both on two nodes without FDCHAN: MPI works with the site's settings and fails with the libfabric components
+off (TCP only); NCCL reaches about 21 GB/s per GPU between the nodes with the site's plugin (sockets: 1.7 GB/s).
+nz = 48 gives 6 planes per GPU, still above the minimum of 3. The same agreement is expected.
 
 ## 4. Performance
 
