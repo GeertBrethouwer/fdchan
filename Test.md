@@ -186,7 +186,8 @@ Expected: `vs scheme` at round-off (about 1e-14 for D1z, up to 1e-11 for D2z on 
 against the exact derivative, and `compact z: OK`. On 4 GPUs (`srun -n 4 ...`) the same: this checks the
 distributed solve and its exchange between the GPUs.
 
-Then the solver: the input of 2.3 with `nz = 100`, `z_scheme = compact`, `fd_order_z = 8`, on 1 and 2 GPUs (50
+`examples/arrhenius_zcompact_test.sh` runs all of this section except the timing (one node, 4 GPUs) and prints a
+summary. Then the solver: the input of 2.3 with `nz = 100`, `z_scheme = compact`, `fd_order_z = 8`, on 1 and 2 GPUs (50
 planes per GPU; compact 8th order needs at least 49). Expected: `log.dat` of 1 and 2 GPUs agree to all printed
 digits except `max|div|`, and `max|div|` stays at round-off (on the CPU ≤ 1e-14). With too few planes per GPU
 fdchan stops at start-up and says how many it needs.
