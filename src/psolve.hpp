@@ -148,4 +148,97 @@ HD inline void band_solve_piv(int N, const real* G0, const real* G1, real k2, Rh
   }
 }
 
+
+// The same banded LU in two parts, for a matrix that does not change (the pressure system of a column depends
+// only on its k2): band_factor_piv once, band_solve_factored for every right-hand side. The factorisation stores
+// the U rows in su(j, 0..KL+KU) (su(j,0) = 1/pivot), the multipliers in sl(j, 0..KL-1) and the pivot choice
+// (0..KL, the window row swapped with the current one) in sp(j). band_solve_factored applies exactly the row
+// operations of band_solve_piv to the right-hand side, so the results are identical to band_solve_piv.
+template <int KL, int KU, class SU, class SL, class SP>
+HD inline void band_factor_piv(int N, const real* G0, const real* G1, real k2, SU su, SL sl, SP sp) {
+  constexpr int W = KL + KU + 1;
+  constexpr int WU = KL + KU + 1;
+  real Wn[KL + 1][WU];
+  auto load = [&](int q, int r, int j) {
+    for (int c = 0; c < WU; ++c) Wn[q][c] = 0;
+    if (r >= N) return;
+    const real* g0 = G0 + idx(r) * W;
+    const real* g1 = G1 + idx(r) * W;
+    for (int d = 0; d < W; ++d) {
+      const int col = r - KL + d;
+      const int off = col - j;
+      if (off >= 0 && off < WU) Wn[q][off] = g0[d] + k2 * g1[d];
+    }
+  };
+  for (int q = 0; q <= KL; ++q) load(q, q, 0);
+  for (int j = 0; j < N; ++j) {
+    int p = 0;
+    real best = Wn[0][0] < 0 ? -Wn[0][0] : Wn[0][0];
+    for (int q = 1; q <= KL; ++q) {
+      if (j + q >= N) break;
+      const real a = Wn[q][0] < 0 ? -Wn[q][0] : Wn[q][0];
+      if (a > best) { best = a; p = q; }
+    }
+    for (int q = 1; q <= KL; ++q)
+      if (q == p)
+        for (int c = 0; c < WU; ++c) { const real t = Wn[0][c]; Wn[0][c] = Wn[q][c]; Wn[q][c] = t; }
+    const real inv = real(1) / Wn[0][0];
+    for (int q = 1; q <= KL; ++q) {
+      const real l = Wn[q][0] * inv;
+      for (int c = 1; c < WU; ++c) Wn[q][c] -= l * Wn[0][c];
+      sl(j, q - 1) = l;
+    }
+    sp(j) = static_cast<unsigned char>(p);
+    su(j, 0) = inv;
+    for (int c = 1; c < WU; ++c) su(j, c) = Wn[0][c];
+    for (int q = 0; q < KL; ++q) {
+      for (int c = 0; c < WU - 1; ++c) Wn[q][c] = Wn[q + 1][c + 1];
+      Wn[q][WU - 1] = 0;
+    }
+    load(KL, j + KL + 1, j + 1);
+  }
+}
+
+template <int KL, int KU, class Rhs, class Out, class SU, class SL, class SP, class SY>
+HD inline void band_solve_factored(int N, Rhs rhs, Out out, SU su, SL sl, SP sp, SY sy) {
+  constexpr int WU = KL + KU + 1;
+  real R[KL + 1][NRHS];
+  auto load = [&](int q, int r) {
+    for (int c = 0; c < NRHS; ++c) R[q][c] = (r < N) ? rhs(r, c) : real(0);
+  };
+  for (int q = 0; q <= KL; ++q) load(q, q);
+  for (int j = 0; j < N; ++j) {
+    const int p = sp(j);
+    if (p > 0)
+      for (int c = 0; c < NRHS; ++c) { const real t = R[0][c]; R[0][c] = R[p][c]; R[p][c] = t; }
+    for (int q = 1; q <= KL; ++q) {
+      const real l = sl(j, q - 1);
+      for (int c = 0; c < NRHS; ++c) R[q][c] -= l * R[0][c];
+    }
+    for (int c = 0; c < NRHS; ++c) sy(j, c) = R[0][c];
+    for (int q = 0; q < KL; ++q)
+      for (int c = 0; c < NRHS; ++c) R[q][c] = R[q + 1][c];
+    load(KL, j + KL + 1);
+  }
+  real X[WU][NRHS];  // X[m-1] = x_{j+m}
+  for (int q = 0; q < WU; ++q)
+    for (int c = 0; c < NRHS; ++c) X[q][c] = 0;
+  for (int j = N - 1; j >= 0; --j) {
+    real yv[NRHS];
+    for (int c = 0; c < NRHS; ++c) yv[c] = sy(j, c);
+    for (int m = 1; m < WU; ++m) {
+      if (j + m >= N) break;
+      const real u = su(j, m);
+      for (int c = 0; c < NRHS; ++c) yv[c] -= u * X[m - 1][c];
+    }
+    const real inv = su(j, 0);
+    for (int q = WU - 1; q > 0; --q)
+      for (int c = 0; c < NRHS; ++c) X[q][c] = X[q - 1][c];
+    for (int c = 0; c < NRHS; ++c) {
+      X[0][c] = yv[c] * inv;
+      out(j, c, X[0][c]);
+    }
+  }
+}
+
 }  // namespace fd

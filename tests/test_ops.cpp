@@ -2,6 +2,7 @@
 // solver (no pivoting) against a dense LU with partial pivoting, over the whole range of k.
 #include <cstdio>
 #include <random>
+#include <string>
 
 #include "../src/operators.hpp"
 #include "../src/psolve.hpp"
@@ -94,6 +95,8 @@ static void pressure_test(const std::vector<double>& y, int p, const BandMat& B)
   }
   std::printf("  ny = %d, p = %d, kl = %d, ku = %d: worst relative difference %.1e\n", n, p, B.kl, B.ku, worst);
 }
+
+static std::string fmt(double v) { char b[32]; std::snprintf(b, sizeof(b), "%.1e", v); return b; }
 
 int main() {
   std::printf("Order of accuracy on a tanh grid (alpha = 3), max error over all points incl. walls\n");
@@ -190,6 +193,12 @@ int main() {
         for (int j = 0; j < ny; ++j)
           for (int c = 0; c < NRHS; ++c) rhs[size_t((2 * j + 1) * NRHS + c)] = U(rng);
         double worst = 0, worst_div = 0;
+        // band_factor_piv + band_solve_factored: the same operations as band_solve_piv (identical results when
+        // the compiler does not fuse multiply-adds differently in the two; otherwise round-off differences)
+        long fact_mismatch = 0;
+        double fact_maxrel = 0;
+        std::vector<double> xf(size_t(N) * NRHS), suf(size_t(N) * (2 * KK + 1)), slf(size_t(N) * KK), syf(size_t(N) * NRHS);
+        std::vector<unsigned char> spf(static_cast<size_t>(N));
         for (double k : {0.1, 0.5, 1.0, 10.0, 100.0, 1e3, 1e4}) {
           const double k2 = k * k;
           band_solve_piv<KK, KK>(
@@ -197,6 +206,26 @@ int main() {
               [&](int r, int c, real v) { x[size_t(r * NRHS + c)] = v; },
               [&](int r, int m) -> real& { return su[size_t(r * (2 * KK + 1) + m)]; },
               [&](int r, int c) -> real& { return sy[size_t(r * NRHS + c)]; });
+          band_factor_piv<KK, KK>(
+              N, g0.data(), g1.data(), real(k2), [&](int r, int m) -> real& { return reinterpret_cast<real&>(suf[size_t(r * (2 * KK + 1) + m)]); },
+              [&](int r, int q) -> real& { return reinterpret_cast<real&>(slf[size_t(r * KK + q)]); },
+              [&](int r) -> unsigned char& { return spf[size_t(r)]; });
+          band_solve_factored<KK, KK>(
+              N, [&](int r, int c) { return real(rhs[size_t(r * NRHS + c)]); },
+              [&](int r, int c, real v) { xf[size_t(r * NRHS + c)] = v; },
+              [&](int r, int m) -> real { return reinterpret_cast<real&>(suf[size_t(r * (2 * KK + 1) + m)]); },
+              [&](int r, int q) -> real { return reinterpret_cast<real&>(slf[size_t(r * KK + q)]); },
+              [&](int r) -> int { return spf[size_t(r)]; },
+              [&](int r, int c) -> real& { return reinterpret_cast<real&>(syf[size_t(r * NRHS + c)]); });
+          {
+            double xmax = 0, dmax = 0;
+            for (size_t m = 0; m < xf.size(); ++m) {
+              fact_mismatch += (xf[m] != x[m]);
+              xmax = std::max(xmax, std::abs(x[m]));
+              dmax = std::max(dmax, std::abs(xf[m] - x[m]));
+            }
+            fact_maxrel = std::max(fact_maxrel, dmax / xmax);
+          }
           std::vector<double> M(size_t(N) * N, 0.0);
           for (int r = 0; r < N; ++r)
             for (int c = std::max(0, r - G0.kl); c <= std::min(N - 1, r + G0.ku); ++c)
@@ -220,8 +249,10 @@ int main() {
             worst_div = std::max(worst_div, pd / pn);
           }
         }
-        std::printf("  %-8s p = %d ny = %3d kl = %d ku = %d: |phi - phi_dense|/|phi| %.1e, |psi - D1 phi|/|psi| %.1e\n",
-                    sch.c_str(), p, ny, G0.kl, G0.ku, worst, worst_div);
+        std::printf("  %-8s p = %d ny = %3d kl = %d ku = %d: |phi - phi_dense|/|phi| %.1e, |psi - D1 phi|/|psi| %.1e, "
+                    "factored once: %s\n",
+                    sch.c_str(), p, ny, G0.kl, G0.ku, worst, worst_div,
+                    fact_mismatch == 0 ? "identical" : (std::string("max|diff|/max|x| ") + fmt(fact_maxrel)).c_str());
       }
   return 0;
 }

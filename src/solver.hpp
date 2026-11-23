@@ -135,6 +135,9 @@ class Solver {
   DArray<int> d_ys[2];
   DArray<real> d_yc[2], d_ylo[2], d_ym[2], d_yup[2], d_yid[2];
   DArray<real> d_kx, d_kzp2, d_G0, d_G1, d_q, d_dyc, d_su, d_sy;
+  DArray<real> d_sl;            // LU multipliers of the pressure columns (factorised once, see factor_columns)
+  DArray<unsigned char> d_sp;   // their pivot choices
+  bool factored = false;
   DArray<cplx> u, v, w, hx, hy, hz_, T1, T2;
   DArray<real> Pb[9];  // 6 always, 3 more for the advective form
   DArray<double> d_prof, d_scal;
@@ -191,6 +194,8 @@ class Solver {
     setup_transpose();
     d_su.alloc(idx(2 * K + 1) * 2 * ny * ncols);
     d_sy.alloc(idx(NRHS) * 2 * ny * ncols);
+    d_sl.alloc(idx(K) * 2 * ny * ncols);
+    d_sp.alloc(idx(2) * ny * ncols);
     d_prof.alloc(4 * idx(ny));
     d_scal.alloc(8);
     xfft.init(mx, idx(nz) * ny);
@@ -417,7 +422,7 @@ class Solver {
     std::printf("pressure  band K = %d, %lld columns of length %d (phi and D1 phi)\n", K, ncols, 2 * ny);
     std::printf("viscous   spectral radii: kx^2 %.3e, D2z %.3e, D2y %.3e\n", kxmax() * kxmax(), lam2z, lam2y);
     const double mb = double(sizeof(real)) / 1048576.0;
-    const double tot = (6.0 * npad + 2.0 * 11 * nsp + (2.0 * K + 1.0 + NRHS) * 2 * ny * ncols) * mb;
+    const double tot = (6.0 * npad + 2.0 * 11 * nsp + (3.0 * K + 1.0 + NRHS) * 2 * ny * ncols) * mb + 2.0 * ny * ncols / 1048576.0;
     std::printf("memory    %.1f MB of field arrays on rank 0 (%.0f bytes per local grid point)\n", tot,
                 tot * 1048576.0 / (double(nx) * ny * nz));
   }
@@ -797,14 +802,37 @@ class Solver {
     g_timer.toc(tm_p_grad);
   }
 
+  // The pressure matrix of a column, G0 + k2 G1, depends only on its k2 = kx^2 + kz'^2, so it is factorised
+  // once (banded LU with partial pivoting: U rows in su, multipliers in sl, pivots in sp) and every RK stage only
+  // does the substitutions. The results are identical to factorising in every solve.
   template <int KK>
-  void solve_impl() {
+  void factor_impl() {
     const int nkx_ = nkl, nz_ = nzg, ny_ = ny, ntz_ = ntz, kx0_ = kx0;
     const idx nc = ncols;
     const real *G0 = d_G0.p, *G1 = d_G1.p;
     const real* kx = d_kx.p;
     const real* kzp2 = d_kzp2.p;
-    real *su = d_su.p, *sy = d_sy.p;
+    real *su = d_su.p, *sl = d_sl.p;
+    unsigned char* sp = d_sp.p;
+    pfor_lines(nc, [=] HD(idx col) {
+      const int t = int(col % ntz_), i = int(col / ntz_);
+      if (i + kx0_ == 0 && (t == 0 || 2 * t == nz_)) return;  // solved separately (zero)
+      const real k2 = kx[i + kx0_] * kx[i + kx0_] + kzp2[t];
+      band_factor_piv<KK, KK>(
+          2 * ny_, G0, G1, k2,
+          [=](int r, int m) -> real& { return su[(idx(r) * (2 * KK + 1) + m) * nc + col]; },
+          [=](int r, int q) -> real& { return sl[(idx(r) * KK + q) * nc + col]; },
+          [=](int r) -> unsigned char& { return sp[idx(r) * nc + col]; });
+    });
+    (void)nkx_; (void)ny_;
+  }
+  template <int KK>
+  void solve_impl() {
+    const int nkx_ = nkl, nz_ = nzg, ny_ = ny, ntz_ = ntz, kx0_ = kx0;
+    const idx nc = ncols;
+    const real *su = d_su.p, *sl = d_sl.p;
+    const unsigned char* sp = d_sp.p;
+    real* sy = d_sy.p;
     cplx* t2 = T2.p;
     const real inz = real(1.0 / nzg);
     pfor_lines(nc, [=] HD(idx col) {
@@ -815,9 +843,8 @@ class Solver {
         for (int j = 0; j < ny_; ++j) t2[(idx(j) * nkx_ + i) * nz_ + t] = cplx(0, 0);
         return;
       }
-      const real k2 = kx[i + kx0_] * kx[i + kx0_] + kzp2[t];
-      band_solve_piv<KK, KK>(
-          2 * ny_, G0, G1, k2,
+      band_solve_factored<KK, KK>(
+          2 * ny_,
           [=](int r, int c) -> real {
             if (r % 2 == 0) return real(0);
             const idx b = (idx(r / 2) * nkx_ + i) * nz_;
@@ -836,11 +863,27 @@ class Solver {
               else t2[b + t2i].im = val;
             }
           },
-          [=](int r, int m) -> real& { return su[(idx(r) * (2 * KK + 1) + m) * nc + col]; },
+          [=](int r, int m) -> real { return su[(idx(r) * (2 * KK + 1) + m) * nc + col]; },
+          [=](int r, int q) -> real { return sl[(idx(r) * KK + q) * nc + col]; },
+          [=](int r) -> int { return sp[idx(r) * nc + col]; },
           [=](int r, int c) -> real& { return sy[(idx(r) * NRHS + c) * nc + col]; });
     });
   }
+  void factor_columns() {
+    switch (K) {
+      case 4: factor_impl<4>(); break;
+      case 6: factor_impl<6>(); break;
+      case 8: factor_impl<8>(); break;
+      case 10: factor_impl<10>(); break;
+      case 12: factor_impl<12>(); break;
+      case 14: factor_impl<14>(); break;
+      case 16: factor_impl<16>(); break;
+      default: fatal("unsupported band width");
+    }
+    factored = true;
+  }
   void solve_columns() {
+    if (!factored) factor_columns();
     switch (K) {
       case 4: solve_impl<4>(); break;
       case 6: solve_impl<6>(); break;

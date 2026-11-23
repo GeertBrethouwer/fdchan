@@ -10,7 +10,8 @@ and z) with
 * **z:** explicit central differences of order 2–8 (`fd_order_z`, default = `fd_order`);
 * **pressure:** exact projection. Continuity (Fourier x, the same first derivatives in y and z) holds to
   round-off at every grid point, walls included. One z-FFT and, per (kx, ±kz) pair, one banded LU solve for φ
-  and D1 φ together; no influence matrix (see [DESIGN.md](DESIGN.md));
+  and D1 φ together (factorised once at the start, since the matrix depends only on kx² + kz′²; every stage
+  does only the substitutions); no influence matrix (see [DESIGN.md](DESIGN.md));
 * **nonlinear terms:** rotational form u × ω (9 x-transforms per stage) or advective form (15);
 * **time:** low-storage RK3 (γ = 8/15, 5/12, 3/4; ζ = 0, −17/60, −5/12), or the 4-stage RK3 of SIMSON
   (`rk_stages = 4`: γ = 8/17, 17/60, 5/12, 3/4; ζ = 0, −15/68, −17/60, −5/12), explicit viscous terms, adaptive Δt
@@ -136,7 +137,7 @@ the peaks of the rms and shear-stress profiles in wall units.
 | test | result |
 |---|---|
 | operators (`make test`) | explicit D1, D2 converge at orders 2–8 on a tanh grid; compact schemes at the order of their wall rows in the max norm |
-| pressure solver | banded LU with pivoting vs dense LU, ny = 33–385, k = 0.1–1e4, all schemes: 1e-12 or better, D1 φ to round-off |
+| pressure solver | banded LU with pivoting vs dense LU, ny = 33–385, k = 0.1–1e4, all schemes: 1e-12 or better, D1 φ to round-off; factorised once + substitutions: identical to factorising in every solve (to round-off where the compiler fuses multiply-adds differently) |
 | laminar Poiseuille, CFR | −dp/dx = 3/Re to all printed digits, divergence 3e-16 |
 | decay of random disturbances, Re = 200 | E′ decays monotonically, −dp/dx → 3/Re |
 | TS wave, Re = 5000, α = 1.12, tanh α_s = 4 | with HiCHAN's stencils and the advective form, HiCHAN's published errors are reproduced (2.65e-5 vs 2.6e-5 for 4th order, 3.4e-7 vs 3e-7 for 6th order, ny = 65); compact 8th order: 1.5e-7 (65), 2e-9 (97). DESIGN.md §5 |

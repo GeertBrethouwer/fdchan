@@ -131,9 +131,12 @@ B1 E ψ − k² A1 P φ = B1 E r_y − A1 c,     c = −(i kx r_x + D1z r_z) ins
 products, no compact solve. With the unknowns interleaved (φ_0, ψ_0, φ_1, …) the matrix has 4 sub- and
 super-diagonals for the compact 4th/6th-order schemes, 8 for compact 8th order and 8–16 for explicit
 differences. It depends on kz only through kz′², so one thread solves the columns +kz and −kz together (four
-real right-hand sides), with a banded LU with partial pivoting computed on the fly: a window of the active rows
-in local memory, every finished U row written once to scratch and read back in the upward sweep. The matrix
-is built from two shared band matrices, G0 + k² G1, so nothing is stored per wavenumber. Pivoting is
+real right-hand sides), with a banded LU with partial pivoting: a window of the active rows in local memory,
+every finished U row written to scratch and read back in the upward sweep. The matrix is built from two shared
+band matrices, G0 + k² G1. Since it depends only on k², the factorisation is done once, at the first pressure
+solve, and kept (U rows, the multipliers and the pivot choices, (3K+1)·2ny reals and 2ny bytes per column);
+every RK stage then only applies the stored row operations to the right-hand sides and substitutes back. On
+4 GH200 (single precision, 2048 × 321 × 1536) the factorisation in every solve took 19% of the time step. Pivoting is
 needed: the wall rows have zero diagonal entries in this ordering.
 
 Tested against dense LU with pivoting (ny = 33–385, orders 4–8, k = 0.1–1e4): φ agrees to 1e-12 or better
