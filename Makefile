@@ -89,6 +89,11 @@ $(FLAGS_STAMP): FORCE
 
 FORCE:
 
+# NCCL check across GPUs and nodes (tools/nccl_check.cu): make GPU=cuda MPI=1 NCCL=1 MPICXX=mpicxx build/nccl_check
+build/nccl_check: tools/nccl_check.cu $(FLAGS_STAMP)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) tools/nccl_check.cu -o $@ $(LIBS)
+
 build/test_ops: tests/test_ops.cpp $(HDR)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(DEFS) tests/test_ops.cpp -o $@ $(LIBS)
