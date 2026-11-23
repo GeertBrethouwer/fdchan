@@ -21,6 +21,7 @@ struct Params {
                                        // SCCHAN: divergence (default for it, 13) | skew (33)
   std::string y_closure = "hichan";  // compact wall closures: hichan | explicit_wall
   int fd_order_z = 0;  // 0: same as fd_order
+  std::string z_scheme = "explicit";  // explicit (fd_order_z 2, 4, 6, 8) | compact (fd_order_z 4, 6, 8)
   bool dealias = true;
   // physics
   double re = 2800;               // U h / nu
@@ -85,7 +86,7 @@ struct Params {
       }
     };
     I("nx", nx); I("ny", ny); I("nz", nz); D("lx", lx); D("lz", lz); S("grid_type", grid_type);
-    D("grid_alpha", grid_alpha); I("fd_order", fd_order); S("y_scheme", y_scheme); S("y_closure", y_closure); S("nl_form", nl_form); I("fd_order_z", fd_order_z); B("dealias", dealias);
+    D("grid_alpha", grid_alpha); I("fd_order", fd_order); S("y_scheme", y_scheme); S("y_closure", y_closure); S("nl_form", nl_form); I("fd_order_z", fd_order_z); S("z_scheme", z_scheme); B("dealias", dealias);
     D("re", re); S("forcing", forcing); D("ubulk", ubulk); D("dpdx", dpdx);
     L("nstep", nstep); D("tmax", tmax); D("wall_time_max", wall_time_max); B("fixed_dt", fixed_dt);
     D("dt", dt); D("dt_max", dt_max); D("dt_growth", dt_growth); D("cfl", cfl); D("cfl_visc", cfl_visc); I("rk_stages", rk_stages);
@@ -104,6 +105,8 @@ struct Params {
     if (fd_order_z == 0) fd_order_z = fd_order;
     if (comm_backend != "" && comm_backend != "nccl" && comm_backend != "mpi") fatal("comm_backend must be nccl or mpi");
     if (fd_order_z % 2 || fd_order_z < 2 || fd_order_z > 8) fatal("fd_order_z must be 2, 4, 6 or 8");
+    if (z_scheme != "explicit" && z_scheme != "compact") fatal("z_scheme must be explicit or compact");
+    if (z_scheme == "compact" && fd_order_z < 4) fatal("compact z_scheme: fd_order_z must be 4, 6 or 8");
   }
   void print() const {
     std::printf("grid      nx = %d, ny = %d, nz = %d, lx = %.6g, lz = %.6g, %s (alpha = %g), order %d (y) %d (z), dealias %d\n",

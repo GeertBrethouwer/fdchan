@@ -26,6 +26,7 @@
 #pragma once
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -48,6 +49,78 @@ struct ZSt {  // periodic central stencils in z, a[l + h], l = -h..h, already di
   real a1[2 * MAXP2 + 1], a2[2 * MAXP2 + 1];
 };
 
+// Compact z-derivative (z_scheme = compact): al f'_{k-1} + f'_k + al f'_{k+1} = sum_l c_l (f_{k+l} - f_{k-l}) (D1), or
+// al f''_{k-1} + f''_k + al f''_{k+1} = sum_l c_l (f_{k+l} - 2 f_k + f_{k-l}) (D2), periodic in z. Distributed over the
+// z-slabs as in x3d2 (DistD2-TDS): every rank solves its block of a line with the Thomas algorithm (y), its block
+// then depends on the outside only through x_{-1} (last value of the previous rank) and x_n (first value of the
+// next one): x = y + x_{-1} p + x_n q, with A p = -al e_0 and A q = -al e_{n-1} (decay vectors, |p_k|, |q_{n-1-k}| ~ r^k).
+// The ranks exchange y_0 and y_{n-1} with their neighbours and solve a 2x2 system per block boundary, dropping the
+// terms of order r^n (exact to round-off when n is large enough, checked at start-up). One rank: exact 2x2 solve.
+struct ZCmp {
+  int L;            // half width of the right-hand side (= halo width)
+  real al;          // alpha of the tridiagonal left-hand side
+  real c[MAXP2];    // c_l / dz (D1) or c_l / dz^2 (D2)
+  const real *cp, *inv, *pv, *qv;  // Thomas factors and decay vectors of the local block (length nz)
+  real p0o, qn1o, p0n, qn1p, il, ir;  // block-boundary coupling with the neighbours
+  real e11, e12, e21, e22;            // one rank: inverse of the exact periodic 2x2 system
+};
+
+// coefficients of the tridiagonal compact scheme of the given order for the d-th derivative (d = 1, 2) on a uniform
+// grid, from the Taylor conditions: unknowns al, c_1..c_L with L = order/2 - 1
+inline void compact_coeffs(int d, int order, double& al, std::vector<double>& c) {
+  const int L = order / 2 - 1, n = L + 1;
+  std::vector<double> M(size_t(n * n), 0.0), b(static_cast<size_t>(n), 0.0);
+  auto fact = [](int m) { double f = 1; for (int i = 2; i <= m; ++i) f *= i; return f; };
+  for (int e = 0; e < n; ++e) {
+    const int m = (d == 1) ? 2 * e + 1 : 2 * e + 2;  // order of the derivative matched
+    // sum_l c_l 2 l^m / m!  -  al * 2 / (m - d)!  =  [m == d]   (the LHS f^(d) of the row itself has coefficient 1)
+    for (int l = 1; l <= L; ++l) M[size_t(e * n + l)] = 2.0 * std::pow(double(l), m) / fact(m);
+    M[size_t(e * n + 0)] = -2.0 / fact(m - d);
+    b[size_t(e)] = (m == d) ? 1.0 : 0.0;
+  }
+  // Gaussian elimination with partial pivoting
+  for (int k = 0; k < n; ++k) {
+    int pr = k;
+    for (int r = k + 1; r < n; ++r)
+      if (std::abs(M[size_t(r * n + k)]) > std::abs(M[size_t(pr * n + k)])) pr = r;
+    for (int cc = 0; cc < n; ++cc) std::swap(M[size_t(k * n + cc)], M[size_t(pr * n + cc)]);
+    std::swap(b[size_t(k)], b[size_t(pr)]);
+    for (int r = k + 1; r < n; ++r) {
+      const double f = M[size_t(r * n + k)] / M[size_t(k * n + k)];
+      for (int cc = k; cc < n; ++cc) M[size_t(r * n + cc)] -= f * M[size_t(k * n + cc)];
+      b[size_t(r)] -= f * b[size_t(k)];
+    }
+  }
+  std::vector<double> x(static_cast<size_t>(n));
+  for (int k = n - 1; k >= 0; --k) {
+    double s = b[size_t(k)];
+    for (int cc = k + 1; cc < n; ++cc) s -= M[size_t(k * n + cc)] * x[size_t(cc)];
+    x[size_t(k)] = s / M[size_t(k * n + k)];
+  }
+  al = x[0];
+  c.assign(x.begin() + 1, x.end());
+}
+
+// Thomas factors of tridiag(al, 1, al) of size n and the solution of A x = rhs (host, double)
+struct TriLocal {
+  std::vector<double> cp, inv;
+  void init(int n, double al) {
+    cp.assign(size_t(n), 0.0); inv.assign(size_t(n), 0.0);
+    for (int k = 0; k < n; ++k) {
+      const double den = (k == 0) ? 1.0 : 1.0 - al * cp[size_t(k - 1)];
+      inv[size_t(k)] = 1.0 / den;
+      cp[size_t(k)] = al / den;
+    }
+  }
+  std::vector<double> solve(const std::vector<double>& r, double al) const {
+    const size_t n = cp.size();
+    std::vector<double> x(n);
+    for (size_t k = 0; k < n; ++k) x[k] = (k == 0 ? r[k] : r[k] - al * x[k - 1]) * inv[k];
+    for (size_t k = n - 1; k-- > 0;) x[k] -= cp[k] * x[k + 1];
+    return x;
+  }
+};
+
 // NF fields swept together along y: the inputs and the arrays that hold the forward-sweep values
 template <int NF>
 struct YLines {
@@ -65,6 +138,7 @@ HD inline cplx zv(const cplx* f, const cplx* hal, idx L, int i, int kk, int j, i
 // pointwise part of rhs(): H = N + nu Lap f, r = f + dtg H + dtz H_old at spectral point n (padded point o)
 struct RhsPoint {
   const cplx *f, *hf;
+  const cplx* d2z = nullptr;  // compact z: D2z f (line length nkx); explicit: nullptr, the stencil of z is used
   cplx *h, *r;
   const real* kx;
   ZSt z;
@@ -78,7 +152,9 @@ struct RhsPoint {
     }
     const cplx fc = f[n];
     cplx lap = (-kx[i] * kx[i]) * fc + d2y;
-    for (int l = -z.h; l <= z.h; ++l) lap += z.a2[l + z.h] * zv(f, hf, nkx, i, k + l, j, nz, z.h, ny, nkx);
+    if (d2z) lap += d2z[n];
+    else
+      for (int l = -z.h; l <= z.h; ++l) lap += z.a2[l + z.h] * zv(f, hf, nkx, i, k + l, j, nz, z.h, ny, nkx);
     cplx hh = sc * r[o] + nuu * lap;
     if (i == 0) hh.re += force;
     r[o] = fc + dtg * hh + dtz * h[n];
@@ -89,16 +165,21 @@ struct RhsPoint {
 // pointwise part of nonlinear(): u, v, w and the vorticity into the padded arrays C0..C5 at padded point n
 struct VortPoint {
   const cplx *U, *V, *W, *hU, *hV;
+  const cplx *dzU = nullptr, *dzV = nullptr;  // compact z: D1z u, D1z v (line length nkx)
   cplx *C0, *C1, *C2, *C3, *C4, *C5;
   const real* kx;
   ZSt z;
   int nkx, nz, ny;
   HD void operator()(idx n, idx s, int i, int k, int j, cplx dyu, cplx dyw) const {
     cplx dzu(0, 0), dzv(0, 0);
-    for (int l = -z.h; l <= z.h; ++l) {
-      if (l == 0) continue;
-      dzu += z.a1[l + z.h] * zv(U, hU, nkx, i, k + l, j, nz, z.h, ny, nkx);
-      dzv += z.a1[l + z.h] * zv(V, hV, nkx, i, k + l, j, nz, z.h, ny, nkx);
+    if (dzU) {
+      dzu = dzU[s]; dzv = dzV[s];
+    } else {
+      for (int l = -z.h; l <= z.h; ++l) {
+        if (l == 0) continue;
+        dzu += z.a1[l + z.h] * zv(U, hU, nkx, i, k + l, j, nz, z.h, ny, nkx);
+        dzv += z.a1[l + z.h] * zv(V, hV, nkx, i, k + l, j, nz, z.h, ny, nkx);
+      }
     }
     cplx uu = U[s], vv = V[s], ww = W[s];
     cplx ox = dyw - dzv, oy = dzu - itimes(kx[i], ww), oz = itimes(kx[i], vv) - dyu;
@@ -125,6 +206,12 @@ class Solver {
   YDeriv D1, D2;
   double kap1 = 1, kap1y = 1, lam2y = 0, lam2z = 0, qint = 0;
   ZSt zs;
+  bool zcomp = false;  // z_scheme = compact
+  ZCmp zc[2];          // D1z, D2z
+  double zc_al[2] = {0, 0}, zc_r[2] = {0, 0};
+  int zc_nmin = 0;
+  DArray<real> d_zcp[2], d_zinv[2], d_zpv[2], d_zqv[2];
+  DArray<cplx> DZ1, DZ2, d_zx;  // compact z: derivative work arrays; first/last values of the lines for the exchange
   // device arrays
   struct YDev {  // a y derivative on the device
     const int* s;
@@ -165,7 +252,7 @@ class Solver {
     nz = zst[size_t(myrank + 1)] - z0;
     kx0 = kxst[size_t(myrank)];
     nkl = kxst[size_t(myrank + 1)] - kx0;
-    hz_halo = P.fd_order_z / 2;
+    hz_halo = (P.z_scheme == "compact") ? P.fd_order_z / 2 - 1 : P.fd_order_z / 2;
     if (nrank > 1 && nz < hz_halo) fatal("z-slab thinner than the stencil half width: use fewer ranks");
     if (nkl < 1) fatal("more ranks than x-modes");
     mx = P.dealias ? 3 * nx / 2 : nx;
@@ -196,6 +283,10 @@ class Solver {
     d_sy.alloc(idx(NRHS) * 2 * ny * ncols);
     d_sl.alloc(idx(K) * 2 * ny * ncols);
     d_sp.alloc(idx(2) * ny * ncols);
+    if (zcomp) {
+      DZ1.alloc(nsp); DZ2.alloc(nsp);
+      d_zx.alloc(4 * idx(ny) * nkx);
+    }
     d_prof.alloc(4 * idx(ny));
     d_scal.alloc(8);
     xfft.init(mx, idx(nz) * ny);
@@ -204,6 +295,152 @@ class Solver {
   }
 
   // ---------------------------------------------------------------- set-up
+  // ---------------------------------------------------------------- compact z (z_scheme = compact)
+  void setup_compact_z(std::vector<double>& kzp2) {
+    zcomp = true;
+    const int pz = P.fd_order_z, L = pz / 2 - 1;
+    zs.h = hz_halo;  // zv() reads the halos with this width; the explicit stencils are not used
+    std::vector<double> c[2];
+    for (int d = 0; d < 2; ++d) {
+      compact_coeffs(d + 1, pz, zc_al[d], c[d]);
+      const double al = zc_al[d];
+      zc_r[d] = (1 - std::sqrt(1 - 4 * al * al)) / (2 * al);  // decay per point of the block coupling
+    }
+    // block coupling dropped between ranks is ~ r^n: n must make it negligible against the round-off of real
+    const double eps = double(std::numeric_limits<real>::epsilon());
+    zc_nmin = int(std::ceil(std::log(0.1 * eps) / std::log(std::max(zc_r[0], zc_r[1]))));
+    if (nrank > 1)
+      for (int r = 0; r < nrank; ++r)
+        if (zst[size_t(r + 1)] - zst[size_t(r)] < zc_nmin) {
+          char msg[256];
+          std::snprintf(msg, sizeof(msg),
+                        "compact z_scheme of order %d needs at least %d z-planes per rank (rank %d has %d): use fewer "
+                        "ranks, more z-points or z_scheme = explicit",
+                        pz, zc_nmin, r, zst[size_t(r + 1)] - zst[size_t(r)]);
+          fatal(msg);
+        }
+    auto ends = [&](int n, double al, double& p0, double& qn1, std::vector<double>* pv, std::vector<double>* qv) {
+      TriLocal T;
+      T.init(n, al);
+      std::vector<double> e(static_cast<size_t>(n), 0.0);
+      e[0] = -al;
+      std::vector<double> p = T.solve(e, al);
+      e[0] = 0; e[size_t(n - 1)] = -al;
+      std::vector<double> q = T.solve(e, al);
+      p0 = p[0]; qn1 = q[size_t(n - 1)];
+      if (pv) *pv = p;
+      if (qv) *qv = q;
+    };
+    auto tor = [](const std::vector<double>& x) { return std::vector<real>(x.begin(), x.end()); };
+    const int prv = (myrank - 1 + nrank) % nrank, nxt = (myrank + 1) % nrank;
+    for (int d = 0; d < 2; ++d) {
+      const double al = zc_al[d], scale = (d == 0) ? 1 / hz : 1 / (hz * hz);
+      ZCmp& Z = zc[d];
+      Z.L = L;
+      Z.al = real(al);
+      for (int l = 0; l < MAXP2; ++l) Z.c[l] = real(l < L ? c[d][size_t(l)] * scale : 0.0);
+      TriLocal T;
+      T.init(nz, al);
+      std::vector<double> p, q;
+      double p0o, qn1o, p0n, qn1n, p0p, qn1p;
+      ends(nz, al, p0o, qn1o, &p, &q);
+      ends(zst[size_t(nxt + 1)] - zst[size_t(nxt)], al, p0n, qn1n, nullptr, nullptr);
+      ends(zst[size_t(prv + 1)] - zst[size_t(prv)], al, p0p, qn1p, nullptr, nullptr);
+      d_zcp[d].alloc(nz); d_zcp[d].upload(tor(T.cp));
+      d_zinv[d].alloc(nz); d_zinv[d].upload(tor(T.inv));
+      d_zpv[d].alloc(nz); d_zpv[d].upload(tor(p));
+      d_zqv[d].alloc(nz); d_zqv[d].upload(tor(q));
+      Z.cp = d_zcp[d].p; Z.inv = d_zinv[d].p; Z.pv = d_zpv[d].p; Z.qv = d_zqv[d].p;
+      Z.p0o = real(p0o); Z.qn1o = real(qn1o); Z.p0n = real(p0n); Z.qn1p = real(qn1p);
+      Z.il = real(1 / (1 - p0o * qn1p));  // boundary with the previous rank
+      Z.ir = real(1 / (1 - p0n * qn1o));  // boundary with the next rank
+      // one rank: x_{-1} = x_{n-1}, x_n = x_0 exactly: [1 - p_{n-1}, -q_{n-1}; -p_0, 1 - q_0] (x_{n-1}, x_0) = (y_{n-1}, y_0)
+      const double m11 = 1 - p[size_t(nz - 1)], m12 = -q[size_t(nz - 1)], m21 = -p[0], m22 = 1 - q[0];
+      const double det = m11 * m22 - m12 * m21;
+      Z.e11 = real(m22 / det); Z.e12 = real(-m12 / det); Z.e21 = real(-m21 / det); Z.e22 = real(m11 / det);
+    }
+    // modified wavenumbers: k' h = 2 sum c_l sin(l th) / (1 + 2 al cos th), k'' h^2 = 2 sum c_l (1 - cos(l th)) / (...)
+    auto k1 = [&](double th) {
+      double s = 0;
+      for (int l = 1; l <= L; ++l) s += 2 * c[0][size_t(l - 1)] * std::sin(l * th);
+      return s / (1 + 2 * zc_al[0] * std::cos(th));
+    };
+    auto k2 = [&](double th) {
+      double s = 0;
+      for (int l = 1; l <= L; ++l) s += 2 * c[1][size_t(l - 1)] * (1 - std::cos(l * th));
+      return s / (1 + 2 * zc_al[1] * std::cos(th));
+    };
+    kap1 = 0; lam2z = 0;
+    for (int t = 0; t < ntz; ++t) {
+      const double th = 2 * M_PI * t / nzg;
+      const double s1 = (2 * t == nzg) ? 0.0 : k1(th);  // exactly zero at the Nyquist wavenumber
+      kzp2[size_t(t)] = (s1 / hz) * (s1 / hz);
+      lam2z = std::max(lam2z, k2(th) / (hz * hz));
+    }
+    for (int t = 0; t <= 2000; ++t) kap1 = std::max(kap1, k1(M_PI * t / 2000));
+  }
+
+  // d-th z-derivative (0: D1z, 1: D2z) of f (line length L, halos in hal) into out (line length nkx), modes i < nkx,
+  // all y; z_scheme = compact only. Two passes over the lines and one exchange of a plane with each neighbour.
+  void zderiv(int d, const cplx* f, idx L, const cplx* hal, cplx* out) {
+    const ZCmp Z = zc[d];
+    const int nz_ = nz, ny_ = ny, nkx_ = nkx, h = hz_halo;
+    const idx nlines = idx(ny_) * nkx_, lstride = nkx_;
+    cplx *sfirst = d_zx.p, *slast = d_zx.p + nlines, *rprev = d_zx.p + 2 * nlines, *rnext = d_zx.p + 3 * nlines;
+    const bool D2 = (d == 1);
+    // 1: right-hand side and the local Thomas solve y, one thread per (kx, y) line
+    pfor_lines(nlines, [=] HD(idx ln) {
+      const int i = int(ln % nkx_), j = int(ln / nkx_);
+      auto F = [&](int kk) { return zv(f, hal, L, i, kk, j, nz_, h, ny_, nkx_); };
+      cplx* o = out + idx(j) * nz_ * lstride + i;  // o[k * lstride]
+      cplx prev(0, 0);
+      for (int k = 0; k < nz_; ++k) {
+        cplx r(0, 0);
+        if (D2) {
+          const cplx f0 = F(k);
+          for (int l = 1; l <= Z.L; ++l) r += Z.c[l - 1] * (F(k + l) + F(k - l) - real(2) * f0);
+        } else {
+          for (int l = 1; l <= Z.L; ++l) r += Z.c[l - 1] * (F(k + l) - F(k - l));
+        }
+        prev = Z.inv[k] * (k == 0 ? r : r - Z.al * prev);
+        o[idx(k) * lstride] = prev;
+      }
+      cplx y = prev;
+      slast[ln] = y;
+      for (int k = nz_ - 2; k >= 0; --k) {
+        y = o[idx(k) * lstride] - Z.cp[k] * y;
+        o[idx(k) * lstride] = y;
+      }
+      sfirst[ln] = y;
+    });
+    // 2: y_{n-1} to the next rank, y_0 to the previous one
+    const bool single = (nrank == 1);
+    if (!single) {
+      g_timer.tic(tm_halo);
+      const int up = (myrank + 1) % nrank, dn = (myrank - 1 + nrank) % nrank;
+      g_comm.sendrecv(reinterpret_cast<const real*>(slast), 2 * nlines, up, reinterpret_cast<real*>(rprev), dn, 21);
+      g_comm.sendrecv(reinterpret_cast<const real*>(sfirst), 2 * nlines, dn, reinterpret_cast<real*>(rnext), up, 22);
+      g_timer.toc(tm_halo);
+    }
+    // 3: x_{-1}, x_n from the 2x2 systems at the block boundaries, x = y + x_{-1} p + x_n q
+    pfor_lines(nlines, [=] HD(idx ln) {
+      const int i = int(ln % nkx_), j = int(ln / nkx_);
+      cplx xm1, xn;
+      if (single) {
+        const cplx yl = slast[ln], yf = sfirst[ln];
+        xm1 = Z.e11 * yl + Z.e12 * yf;  // x_{n-1}
+        xn = Z.e21 * yl + Z.e22 * yf;   // x_0
+      } else {
+        const cplx ylp = rprev[ln], yfn = rnext[ln], y0 = sfirst[ln], yl = slast[ln];
+        const cplx x0 = Z.il * (y0 + Z.p0o * ylp);  // first value of this block
+        xm1 = ylp + Z.qn1p * x0;                     // last value of the previous block
+        xn = Z.ir * (yfn + Z.p0n * yl);              // first value of the next block
+      }
+      cplx* o = out + idx(j) * nz_ * lstride + i;
+      for (int k = 0; k < nz_; ++k) o[idx(k) * lstride] = o[idx(k) * lstride] + Z.pv[k] * xm1 + Z.qv[k] * xn;
+    });
+  }
+
   void setup_operators() {
     const int p = P.fd_order;
     const bool cmp = (P.y_scheme == "compact");
@@ -248,13 +485,16 @@ class Solver {
     d_dyc.alloc(ny); d_dyc.upload(tor(dyc));
     // z stencils and modified wavenumbers
     const int pz = P.fd_order_z;
+    std::vector<double> kzp2(static_cast<size_t>(ntz));
+    if (P.z_scheme == "compact") {
+      setup_compact_z(kzp2);
+    } else {
     std::vector<double> a1 = central_weights(1, pz), a2 = central_weights(2, pz);
     zs.h = pz / 2;
     for (int l = 0; l <= pz; ++l) {
       zs.a1[l] = real(a1[size_t(l)] / hz);
       zs.a2[l] = real(a2[size_t(l)] / (hz * hz));
     }
-    std::vector<double> kzp2(static_cast<size_t>(ntz));
     kap1 = 0; lam2z = 0;
     for (int t = 0; t < ntz; ++t) {
       const double th = 2 * M_PI * t / nzg;
@@ -271,6 +511,7 @@ class Solver {
       double s1 = 0;
       for (int l = 1; l <= pz / 2; ++l) s1 += 2 * a1[size_t(pz / 2 + l)] * std::sin(l * M_PI * t / 2000);
       kap1 = std::max(kap1, s1);
+    }
     }
     d_kzp2.alloc(ntz); d_kzp2.upload(tor(kzp2));
     kx_h.resize(size_t(nkx));
@@ -418,11 +659,17 @@ class Solver {
                 zst[1] - zst[0], zst[size_t(nrank)] - zst[size_t(nrank - 1)], kxst[1] - kxst[0],
                 kxst[size_t(nrank)] - kxst[size_t(nrank - 1)]);
     std::printf("y grid    dy_wall = %.3e, dy_centre = %.3e\n", y[1] - y[0], y[size_t(ny / 2 + 1)] - y[size_t(ny / 2)]);
-    std::printf("y scheme  %s, order %d; z order %d\n", P.y_scheme.c_str(), P.fd_order, P.fd_order_z);
+    std::printf("y scheme  %s, order %d; z scheme %s, order %d\n", P.y_scheme.c_str(), P.fd_order, P.z_scheme.c_str(),
+                P.fd_order_z);
+    if (zcomp)
+      std::printf("z compact alpha D1z %.6f, D2z %.6f; block coupling decays as %.3f^n, needs >= %d z-planes per rank "
+                  "(here %d..%d)\n", zc_al[0], zc_al[1], std::max(zc_r[0], zc_r[1]), zc_nmin, zst[1] - zst[0],
+                  zst[size_t(nrank)] - zst[size_t(nrank - 1)]);
     std::printf("pressure  band K = %d, %lld columns of length %d (phi and D1 phi)\n", K, ncols, 2 * ny);
     std::printf("viscous   spectral radii: kx^2 %.3e, D2z %.3e, D2y %.3e\n", kxmax() * kxmax(), lam2z, lam2y);
     const double mb = double(sizeof(real)) / 1048576.0;
-    const double tot = (6.0 * npad + 2.0 * 11 * nsp + (3.0 * K + 1.0 + NRHS) * 2 * ny * ncols) * mb + 2.0 * ny * ncols / 1048576.0;
+    const double tot = (6.0 * npad + 2.0 * (11 + (zcomp ? 2 : 0)) * nsp + (3.0 * K + 1.0 + NRHS) * 2 * ny * ncols) * mb +
+                       2.0 * ny * ncols / 1048576.0;
     std::printf("memory    %.1f MB of field arrays on rank 0 (%.0f bytes per local grid point)\n", tot,
                 tot * 1048576.0 / (double(nx) * ny * nz));
   }
@@ -533,6 +780,11 @@ class Solver {
     pt.C2 = reinterpret_cast<cplx*>(Pb[2].p); pt.C3 = reinterpret_cast<cplx*>(Pb[3].p);
     pt.C4 = reinterpret_cast<cplx*>(Pb[4].p); pt.C5 = reinterpret_cast<cplx*>(Pb[5].p);
     pt.kx = d_kx.p; pt.z = zs; pt.nkx = nkx_; pt.nz = nz_; pt.ny = ny_;
+    if (zcomp) {  // compact z: D1z u and D1z v first
+      zderiv(0, u.p, nkx, hbA.p, DZ1.p);
+      zderiv(0, v.p, nkx, hbB.p, DZ2.p);
+      pt.dzU = DZ1.p; pt.dzV = DZ2.p;
+    }
     const idx nl = idx(nz_) * nkx_;
     if (P.fuse_y) {
       // Dy u and Dy w are formed in one y-sweep and used at once: one thread per padded (x, z) line
@@ -607,6 +859,8 @@ class Solver {
       const cplx* hf = HB[comp];
       ydiff(0, f, T1.p);
       const cplx* dyf = T1.p;
+      if (zcomp) zderiv(0, f, nkx_, hf, DZ1.p);
+      const cplx* dzf = zcomp ? DZ1.p : nullptr;
       cplx *G0 = reinterpret_cast<cplx*>(Pb[6].p), *G1 = reinterpret_cast<cplx*>(Pb[7].p),
            *G2 = reinterpret_cast<cplx*>(Pb[8].p);
       pfor(idx(lp_) * nz_ * ny_, [=] HD(idx n) {
@@ -616,10 +870,12 @@ class Solver {
           const int k = int(kj % nz_), j = int(kj / nz_);
           const idx s = kj * nkx_ + i;
           cplx dz(0, 0);
-          for (int l = -z.h; l <= z.h; ++l) {
-            if (l == 0) continue;
-            dz += z.a1[l + z.h] * zv(f, hf, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
-          }
+          if (dzf) dz = dzf[s];
+          else
+            for (int l = -z.h; l <= z.h; ++l) {
+              if (l == 0) continue;
+              dz += z.a1[l + z.h] * zv(f, hf, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
+            }
           cplx dx = itimes(kx[i], f[s]), dy = dyf[s];
           if (i == 0) { dx.im = 0; dy.im = 0; dz.im = 0; }
           G0[n] = dx; G1[n] = dy; G2[n] = dz;
@@ -683,6 +939,10 @@ class Solver {
       pt.f = f; pt.hf = hf; pt.h = h; pt.r = r; pt.kx = kx; pt.z = z;
       pt.nkx = nkx_; pt.nz = nz_; pt.ny = ny_;
       pt.sc = sc; pt.nuu = nuu; pt.dtg = dtg; pt.dtz = dtz; pt.force = force;
+      if (zcomp) {  // compact z: D2z f first
+        zderiv(1, f, nkx_, hf, DZ1.p);
+        pt.d2z = DZ1.p;
+      }
       if (P.fuse_y) {
         // D2y f is formed in the y-sweep and used at once (x3d2's fused transport kernels): one thread per
         // (kx, z) line, no D2y array written and read again
@@ -719,6 +979,8 @@ class Solver {
     g_timer.tic(tm_p_rhs);
     halo(Rz, lp_, hbA.p);
     const cplx* hR = hbA.p;
+    if (zcomp) zderiv(0, Rz, lp_, hR, DZ1.p);
+    const cplx* dzr = zcomp ? DZ1.p : nullptr;
     // right-hand side  (B1 E r_y)_j - (A1 c)_j,  c = -(i kx r_x + D1z r_z) at interior points, 0 at the walls
     pfor(nsp, [=] HD(idx n) {
       const int i = int(n % nkx_);
@@ -727,10 +989,12 @@ class Solver {
       auto cval = [&](int jj) -> cplx {
         if (jj <= 0 || jj >= ny_ - 1) return cplx(0, 0);
         cplx d = itimes(kx[i], Rx[(idx(jj) * nz_ + k) * lp_ + i]);
-        for (int l = -z.h; l <= z.h; ++l) {
-          if (l == 0) continue;
-          d += z.a1[l + z.h] * zv(Rz, hR, lp_, i, k + l, jj, nz_, z.h, ny_, nkx_);
-        }
+        if (dzr) d += dzr[(idx(jj) * nz_ + k) * nkx_ + i];
+        else
+          for (int l = -z.h; l <= z.h; ++l) {
+            if (l == 0) continue;
+            d += z.a1[l + z.h] * zv(Rz, hR, lp_, i, k + l, jj, nz_, z.h, ny_, nkx_);
+          }
         return -d;
       };
       cplx s(0, 0);
@@ -759,6 +1023,8 @@ class Solver {
     g_timer.tic(tm_p_grad);
     halo(t1, nkx_, hbB.p);
     const cplx* hP = hbB.p;
+    if (zcomp) zderiv(0, t1, nkx_, hP, DZ1.p);
+    const cplx* dzp = zcomp ? DZ1.p : nullptr;
     ydiff(0, T1.p, T2.p);  // D1y phi
     // u = r - grad phi
     cplx *U = u.p, *V = v.p, *Wv = w.p;
@@ -772,10 +1038,12 @@ class Solver {
       }
       const idx o = kj * lp_ + i;
       cplx gz(0, 0);
-      for (int l = -z.h; l <= z.h; ++l) {
-        if (l == 0) continue;
-        gz += z.a1[l + z.h] * zv(t1, hP, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
-      }
+      if (dzp) gz = dzp[n];
+      else
+        for (int l = -z.h; l <= z.h; ++l) {
+          if (l == 0) continue;
+          gz += z.a1[l + z.h] * zv(t1, hP, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
+        }
       cplx uu = Rx[o] - itimes(kx[i], t1[n]);
       cplx vv = Ry[o] - t2[n];
       cplx ww = Rz[o] - gz;
@@ -1087,6 +1355,8 @@ class Solver {
     ydiff(0, v.p, T1.p);
     halo(w.p, nkx, hbC.p);
     const cplx* hW = hbC.p;
+    if (zcomp) zderiv(0, w.p, nkx, hW, DZ1.p);
+    const cplx* dzw = zcomp ? DZ1.p : nullptr;
     const cplx *U = u.p, *Wv = w.p, *dyv = T1.p;
     const real* kx = d_kx.p;
     const ZSt z = zs;
@@ -1095,10 +1365,12 @@ class Solver {
       const idx kj = n / nkx_;
       const int k = int(kj % nz_), j = int(kj / nz_);
       cplx d = itimes(kx[i], U[n]) + dyv[n];
-      for (int l = -z.h; l <= z.h; ++l) {
-        if (l == 0) continue;
-        d += z.a1[l + z.h] * zv(Wv, hW, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
-      }
+      if (dzw) d += dzw[n];
+      else
+        for (int l = -z.h; l <= z.h; ++l) {
+          if (l == 0) continue;
+          d += z.a1[l + z.h] * zv(Wv, hW, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
+        }
       return sqrt(abs2(d));
     }));
   }

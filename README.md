@@ -7,7 +7,12 @@ and z) with
 * **y:** compact finite differences (default; HiCHAN's 4th- and 6th-order schemes and an 8th-order variant) or
   explicit ones (order 2–8), computed directly on the stretched grid. With a z-slab decomposition every y-column
   is on one GPU, so the compact solves need no communication;
-* **z:** explicit central differences of order 2–8 (`fd_order_z`, default = `fd_order`);
+* **z:** explicit central differences of order 2–8 (`fd_order_z`, default = `fd_order`), or compact (tridiagonal)
+  differences of order 4, 6 or 8 (`z_scheme = compact`). Compact z resolves more of the wavenumber range: for the
+  same accuracy about 30 % (6th order) or 40 % (8th order) fewer z-points than explicit 6th order. Across the
+  z-slabs the compact derivatives are solved as in x3d2 (DistD2-TDS): a local Thomas sweep per block, one exchange
+  of a plane with each neighbour, a 2×2 system per block boundary. This needs at least 30 / 40 / 49 z-planes per
+  rank (order 4 / 6 / 8, double precision; about half in single precision), checked at start-up;
 * **pressure:** exact projection. Continuity (Fourier x, the same first derivatives in y and z) holds to
   round-off at every grid point, walls included. One z-FFT and, per (kx, ±kz) pair, one banded LU solve for φ
   and D1 φ together (factorised once at the start, since the matrix depends only on kx² + kz′²; every stage
@@ -76,6 +81,7 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `y_scheme` | compact | `compact` (`fd_order` 4, 6 or 8) or `explicit` (`fd_order` 2, 4, 6 or 8) |
 | `y_closure` | hichan | compact wall closures for orders 4 and 6: `hichan` (exactly HiCHAN's (3-4-3) and (3-5-6-5-3) schemes) or `explicit_wall`; order 8 always uses explicit wall rows |
 | `fd_order`, `fd_order_z` | 6, = fd_order | order of the y and z differences |
+| `z_scheme` | explicit | `explicit` (`fd_order_z` 2, 4, 6, 8) or `compact` (`fd_order_z` 4, 6, 8); compact needs ≥ 30 / 40 / 49 z-planes per rank (double precision) |
 | `nl_form` | rotational | `rotational` or `advective` |
 | `dealias` | true | 3/2 rule in x |
 | `re` | 2800 | U h/ν |
@@ -136,6 +142,8 @@ the peaks of the rms and shear-stress profiles in wall units.
 
 | test | result |
 |---|---|
+| compact z (`make test`, `tests/test_zcompact.cpp`; with MPI on several ranks) | D1z, D2z of order 4, 6, 8 against the exact answer of the periodic scheme: round-off on 1–4 ranks, also uneven slabs and single precision; against the true derivative: orders 4.0, 6.0, 8.0 |
+| compact z, full solver | turbulent channel 32 × 65 × 96 (100): divergence ≤ 8e-15, 1 and 2 ranks agree to all printed digits; explicit z unchanged (bit-identical on 1, 2, 3, 5 ranks) |
 | operators (`make test`) | explicit D1, D2 converge at orders 2–8 on a tanh grid; compact schemes at the order of their wall rows in the max norm |
 | pressure solver | banded LU with pivoting vs dense LU, ny = 33–385, k = 0.1–1e4, all schemes: 1e-12 or better, D1 φ to round-off; factorised once + substitutions: identical to factorising in every solve (to round-off where the compiler fuses multiply-adds differently) |
 | laminar Poiseuille, CFR | −dp/dx = 3/Re to all printed digits, divergence 3e-16 |

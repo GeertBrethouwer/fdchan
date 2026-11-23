@@ -173,6 +173,28 @@ checks both on two nodes without FDCHAN: MPI works with the site's settings and 
 off (TCP only); NCCL reaches about 21 GB/s per GPU between the nodes with the site's plugin (sockets: 1.7 GB/s).
 nz = 48 gives 6 planes per GPU, still above the minimum of 3. The same agreement is expected.
 
+### 3.4 Compact differences in z (`z_scheme = compact`)
+
+First the derivatives alone, on one GPU (the same test runs on the CPU in `make test`):
+
+```bash
+make GPU=cuda ARCH=sm_90 MPI=1 NCCL=1 MPICXX=mpicxx build/test_zcompact
+srun -n 1 --gpus=1 env OMPI_MCA_btl=^ofi OMPI_MCA_mtl=^ofi build/test_zcompact
+```
+
+Expected: `vs scheme` at round-off (about 1e-14 for D1z, up to 1e-11 for D2z on the finest grid), orders 4, 6, 8
+against the exact derivative, and `compact z: OK`. On 4 GPUs (`srun -n 4 ...`) the same: this checks the
+distributed solve and its exchange between the GPUs.
+
+Then the solver: the input of 2.3 with `nz = 100`, `z_scheme = compact`, `fd_order_z = 8`, on 1 and 2 GPUs (50
+planes per GPU; compact 8th order needs at least 49). Expected: `log.dat` of 1 and 2 GPUs agree to all printed
+digits except `max|div|`, and `max|div|` stays at round-off (on the CPU ≤ 1e-14). With too few planes per GPU
+fdchan stops at start-up and says how many it needs.
+
+For the performance, run the production case once with `z_scheme = explicit` (`fd_order_z = 6`) and once with
+`z_scheme = compact` (`fd_order_z = 6` and 8) at the same nz, `timing = 1`. The difference per step is the cost of
+the compact derivatives; compact z then allows about 30 % (6th) or 40 % (8th) fewer z-points for the same accuracy.
+
 ## 4. Performance
 
 All runs with `timing = 1` in the input: at the end FDCHAN prints the same kind of timing report as HiCHAN

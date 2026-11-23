@@ -81,15 +81,36 @@ up to ~100–200 GPUs for nz = 1536–1920. Beyond that, a second split in y (P-
 small y-groups, pressure transposes from (y, z)-split to kx-split) is the planned extension; the decomposition
 code keeps py = 1 for this.
 
-### 1.3 Compact differences in z?
+### 1.3 Compact differences in z (`z_scheme = compact`)
 
-On one GPU a compact z-derivative costs a stencil pass plus a periodic tridiagonal sweep (about 3 passes instead
-of 1), about +10–15 % per stage for the ≈ 7 z-derivatives of a stage, in exchange for fewer z points (≈ 1.1–1.2×
-the Fourier modes instead of 1.5×). On several GPUs every z-derivative becomes a distributed cyclic tridiagonal
-solve (a local sweep, a small reduced system exchanged among the z-ranks, a back-substitution; P-TDMA of Diez
-Sanhueza et al. 2025). The data volume is tiny, but these are ≈ 20 synchronising collectives per time step.
-Doing it with z-FFTs instead would bring back HiCHAN's transposes, and then Fourier in z is better. Not
-implemented; worth it only if measurements show that z dominates.
+Compact (tridiagonal) z-differences of order 4, 6 or 8 resolve more of the wavenumber range than explicit ones.
+Fraction of 0..π/h resolved within 1 % (0.1 %): explicit 6th 0.35 (0.23), explicit 8th 0.43 (0.31), compact 6th
+0.50 (0.35), compact 8th 0.58 (0.45). For the same z-accuracy that is about 30 % (compact 6th) or 40 % (compact 8th)
+fewer z-points than explicit 6th order, and nearly every cost of FDCHAN scales with nz.
+
+On a uniform periodic z-grid a compact derivative is still diagonal after the z-FFT, so the pressure solve stays
+exact: only the modified wavenumbers change, k′h = 2 Σ c_l sin(lθ) / (1 + 2α cos θ) (D1z, in `kzp2` and the CFL
+limit) and k″h² = 2 Σ c_l (1 − cos lθ) / (1 + 2α cos θ) (D2z, in the viscous limit). The coefficients (α, c_l)
+are computed at start-up from the Taylor conditions (`compact_coeffs`): D1z 6th α = 1/3, 8th α = 3/8; D2z 6th
+α = 2/11, 8th α = 9/38. Compact D2z has a larger spectral radius than explicit D2z of the same order (6th: 6.86
+against 6.04), so the viscous time-step limit from z is about 12 % smaller.
+
+Distribution over the z-slabs follows x3d2 (DistD2-TDS, `src/backend/cuda/kernels/distributed.f90`,
+`src/dist_reduced.f90` there), in `Solver::zderiv`: one thread per (kx, y) line forms the right-hand side from its
+planes and halos (2 planes for 6th, 3 for 8th order) and solves its block with the Thomas algorithm (y). The block
+then depends on the rest of the line only through x₋₁ (last value of the previous rank) and xₙ (first value of the
+next): x = y + x₋₁ p + xₙ q, with precomputed decay vectors A p = −α e₀, A q = −α eₙ₋₁. The ranks exchange y₀ and
+yₙ₋₁ with their neighbours (one plane each, through NCCL or MPI) and solve a 2×2 system per block boundary,
+dropping terms of order rⁿ, r = (1 − √(1 − 4α²)) / (2α) (0.38 for 6th, 0.45 for 8th order). That is exact to
+round-off for n ≥ 40 (6th) or 49 (8th) planes per rank in double precision, checked at start-up; one rank solves
+the periodic 2×2 system exactly. The communication is one plane each way per derivative, no collectives.
+
+Cost: each z-derivative is now two passes over the lines (right-hand side + Thomas sweep, then the correction)
+instead of an inline stencil, and the kernels read the derivative from a work array (`DZ1`, `DZ2`: two extra
+fields). Per RK stage there are 4 first and 3 second z-derivatives (∂v/∂z and ∂u/∂z for the vorticity, ∂R_z/∂z
+and ∂φ/∂z in the pressure step, D2z of u, v, w). *Estimate:* about 5–10 % more time per step than explicit z,
+against 30–40 % fewer points. Not yet fused into the kernels that use the derivatives (as x3d2's transeq kernels
+do); that is the next step if the measurements show the derivative passes to matter.
 
 ## 2. Spatial discretisation
 

@@ -100,12 +100,17 @@ build/mpi_check: tools/mpi_check.cpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) tools/mpi_check.cpp -o $@ $(LIBS)
 
+build/test_zcompact: tests/test_zcompact.cpp $(HDR)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(DEFS) tests/test_zcompact.cpp -o $@ $(LIBS)
+
 build/test_ops: tests/test_ops.cpp $(HDR)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(DEFS) tests/test_ops.cpp -o $@ $(LIBS)
 
-test: build/test_ops
+test: build/test_ops build/test_zcompact
 	./build/test_ops
+	./build/test_zcompact
 
 clean:
 	rm -rf build
