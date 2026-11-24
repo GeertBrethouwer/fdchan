@@ -196,6 +196,26 @@ For the performance, run the production case once with `z_scheme = explicit` (`f
 `z_scheme = compact` (`fd_order_z = 6` and 8) at the same nz, `timing = 1`. The difference per step is the cost of
 the compact derivatives; compact z then allows about 30 % (6th) or 40 % (8th) fewer z-points for the same accuracy.
 
+### 3.5 Scalars (`nscal > 0`)
+
+`examples/arrhenius_scalars_test.sh` (one node, about 10 minutes) builds nothing; build first as its header says
+(`rm -f build/test_scalars` before `make ... build/test_scalars`, so that the GPU version replaces a CPU one). It runs
+
+1. `build/test_scalars` on 1 and 4 GPUs (the CPU version runs in `make test`). Expected `scalars: OK`: decay of single
+   modes (Dirichlet and Neumann walls, θ = 0, 0.5, 1) against the exact decay (about 6e-8 for θ ≤ 0.5, 1e-4 for
+   θ = 1, which is first order in time; Neumann 3e-4 at ny = 41, 3rd order in y), steady profiles with Neumann walls
+   and sources (3e-11), hydrostatic balance with Ri = 2 (velocity ≤ 1e-16), the advective, divergence and skew
+   forms within 3e-3 of each other. In single precision (`FD=$HOME/fdchan_sp`) the errors stop at about 1e-4.
+2. `examples/turb_scalars` for 30 steps on 1 and 2 GPUs. Expected: `log.dat` agrees in all printed digits except
+   max|div|; dS2dy_b stays exactly 0.5 (Neumann wall).
+3. a restart written on 1 GPU (step 20) and read on 2: the first line equals the line of step 20.
+
+The summary also prints the time of the scalars from `timing_report.txt` (the explicit terms are part of the
+nonlinear terms, the update and implicit y-solve a separate line). Per scalar and stage: 3 backward and 1 forward
+x-FFT (advective form; 4 + 4 for divergence and skew), one halo exchange (two for divergence and skew), and the
+y-solve (local, no communication). Expect each scalar to cost about a third to a half of the velocity's nonlinear
+terms.
+
 ## 4. Performance
 
 All runs with `timing = 1` in the input: at the end FDCHAN prints the same kind of timing report as HiCHAN

@@ -22,7 +22,10 @@ and z) with
   (`rk_stages = 4`: γ = 8/17, 17/60, 5/12, 3/4; ζ = 0, −15/68, −17/60, −5/12), explicit viscous terms, adaptive Δt
   from the advective and viscous limits;
 * **forcing:** constant flow rate (`cfr`, exact correction of the mean flow every stage) or constant pressure
-  gradient (`cpg`).
+  gradient (`cpg`);
+* **scalars** (`nscal` ≤ 8, as HiCHAN): passive or active (Boussinesq buoyancy −Ri s ĝ) scalars with Dirichlet or
+  Neumann walls, sources Q_c + Q_u u/U_b, advective, divergence or skew-symmetric form. Diffusion in x and y with
+  the θ-method (HiCHAN's implicit y-solve with the influence matrix of the wall conditions), in z explicit.
 
 The motivation and the comparison with HiCHAN (cost model, pressure-solver options, influence matrix,
 velocity–vorticity formulation, accuracy) are in [DESIGN.md](DESIGN.md).
@@ -35,8 +38,8 @@ exchanges and all-to-alls go through NCCL (RCCL on AMD), which uses NVLink betwe
 the solver stream; MPI still starts the ranks and does the reductions and restart files.
 
 **Status:** the CUDA and HIP builds have not been compiled yet (no GPU compiler was available where the code was
-written; [Test.md](Test.md) describes the tests on Arrhenius); the CPU build runs exactly the same kernel code and is tested, with 1–4 MPI ranks. Scalars, an implicit
-wall-normal viscous term, 3D field output and a second split in y (for several hundred GPUs) are not written yet.
+written; [Test.md](Test.md) describes the tests on Arrhenius); the CPU build runs exactly the same kernel code and is tested, with 1–4 MPI ranks. An implicit
+wall-normal viscous term (velocity), 3D field output and a second split in y (for several hundred GPUs) are not written yet.
 
 ## Building
 
@@ -100,6 +103,21 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `fuse_y` | true | form the y-derivatives inside the kernels that use them (one thread per y-line, no derivative arrays written and read back; as x3d2's fused transport kernels). `false`: separate derivative and pointwise kernels. Same results to the last bit |
 | `nthreads` | all cores | CPU build only (threads per rank) |
 
+Scalars (HiCHAN's `&scalars` and `&buoyancy` items; lists are comma or space separated, one value per scalar):
+
+| item | default | meaning |
+|---|---|---|
+| `nscal` | 0 | number of scalars (0–8) |
+| `pr` | 1 | Prandtl/Schmidt number, diffusivity κ = ν/Pr |
+| `scal_theta` | 0.5 | θ of the θ-method for the diffusion in x and y (0 explicit, 0.5 Crank–Nicolson, 1 implicit Euler); z is always explicit |
+| `sbc_bot`, `sbc_top` | D, D | wall conditions: `D` (s = value) or `N` (∂s/∂y = value) |
+| `sval_bot`, `sval_top` | 1, −1 | the wall values (uniform along the wall) |
+| `ssrc_const`, `ssrc_u` | 0, 0 | source Q_c + Q_u u/`ubulk` |
+| `sinit` | linear | `linear` (conduction profile if both walls are D, else zero), `zero`, `noise` (linear + random large-scale modes of rms `init_amp`) |
+| `scal_form` | advective | `advective` u·∇s, `divergence` ∇·(us), `skew` (the mean of both) |
+| `ri` | 0 | Richardson number per scalar: momentum source −Ri s ĝ (0: passive) |
+| `gravity` | 0, −1, 0 | direction of gravity (normalised) |
+
 ## Tools
 
 `python3 tools/plus_units.py data/stats.dat RE [data/log.dat t_start]`: u_τ, Re_τ, centreline U⁺ and
@@ -107,19 +125,22 @@ the peaks of the rms and shear-stress profiles in wall units.
 
 ## Output
 
-`log.dat` and `stats.dat` have the same columns, headers and number formats as HiCHAN's (without the scalar
-columns, as FDCHAN has no scalars yet), so the same tools read both.
+`log.dat` and `stats.dat` have the same columns, headers and number formats as HiCHAN's, scalar columns included,
+so the same tools read both.
 
 * `log.dat`: `step time dt ubulk dpdx_applied tau_w Re_tau div_max Ekin E_mode`: τ_w the mean of both walls,
   Re_τ = √τ_w/ν, div_max = max |div u| over all points (walls included), Ekin = ½ ⟨u′·u′⟩ averaged over the
   channel, E_mode = ∫ (|û|² + |v̂|² + |ŵ|²) dy of the Fourier mode (`mode_log_kx`, `mode_log_kz`). Format
-  `(i9, 6es14.6, es11.3, 2es14.6)`.
+  `(i9, 6es14.6, es11.3, 2es14.6)`. Then per scalar n `dS<n>dy_b dS<n>dy_t`: dS/dy of the mean scalar at the
+  bottom and top wall (`2es14.6`).
 * `stats.dat`: time-weighted averages (weight Δt × `iout_stats`) of `U V W uu vv ww uv uw vw P pp` against y:
   the means, the moments ⟨f′g′⟩ (Parseval in x, averages over z), and the pressure of the last RK stage. As in
   HiCHAN the mean (kx = kz = 0) mode of the pressure is not computed, so P is 0 and pp is the variance of its
-  fluctuations; with `nl_form = rotational` it is the total pressure p + |u|²/2. Format `es16.7e3`, three
-  header lines.
-* `restart.bin`: the spectral fields (kx, z, y) and the time; written at the end and every `iout_restart` steps.
+  fluctuations; with `nl_form = rotational` it is the total pressure p + |u|²/2. Then per scalar n
+  `S<n> s<n>s<n> us<n> vs<n> ws<n>` (mean, variance, fluxes). Format `es16.7e3`, three header lines.
+* `restart.bin`: the spectral fields (kx, z, y) of u, v, w and the scalars, and the time; written at the end and
+  every `iout_restart` steps. A file with fewer scalars (e.g. from a run without scalars) can be read: the missing
+  scalars are initialised as given by `sinit`.
 * With `timing = 1` (as HiCHAN's `timing = .true.`):
   * `timing_report.txt` (also printed at the end of the run): the wall-clock time spent in each part of the
     time loop: RK steps, nonlinear terms, time-step limit, right-hand side, pressure (split into its
@@ -144,6 +165,7 @@ columns, as FDCHAN has no scalars yet), so the same tools read both.
 | `examples/laminar` | laminar Poiseuille flow, CFR: −dp/dx = 3/Re, divergence at round-off (seconds) |
 | `examples/ts_wave` | Tollmien–Schlichting wave as in HiCHAN's `examples/ts_wave`; `python3 fit.py data/log.dat 250` gives the decay rate (minutes on a CPU) |
 | `examples/turb_coarse` | coarse turbulent channel from noise, Re_b = 2800 (about 30 minutes on a laptop CPU) |
+| `examples/turb_scalars` | `turb_coarse` with two scalars: a weakly stably stratified one (Ri = 0.05, D/D) and a passive one with a Neumann wall and sources, skew form |
 | `examples/retau180` | Re_τ = 180 in HiCHAN's box (4π × 4π/3), for a GPU |
 | `examples/arrhenius_bench.sh` | time per step of FDCHAN and HiCHAN on one Arrhenius GH200 |
 
@@ -155,6 +177,8 @@ columns, as FDCHAN has no scalars yet), so the same tools read both.
 | compact z, full solver | turbulent channel 32 × 65 × 96 (100): divergence ≤ 8e-15, 1 and 2 ranks agree to all printed digits; explicit z unchanged (bit-identical on 1, 2, 3, 5 ranks) |
 | operators (`make test`) | explicit D1, D2 converge at orders 2–8 on a tanh grid; compact schemes at the order of their wall rows in the max norm |
 | pressure solver | banded LU with pivoting vs dense LU, ny = 33–385, k = 0.1–1e4, all schemes: 1e-12 or better, D1 φ to round-off; factorised once + substitutions: identical to factorising in every solve (to round-off where the compiler fuses multiply-adds differently) |
+| scalars (`make test`, `tests/test_scalars.cpp`; with MPI on several ranks) | decay of single modes (Dirichlet/Neumann, mean and non-mean, θ = 0, 0.5, 1) against the exact decay: 6e-8 (θ ≤ 0.5), Neumann case 3rd order in y (the wall closures); steady quadratic profiles with Neumann walls and sources: 3e-11; hydrostatic balance (Ri = 2): velocity stays at 1e-17; advective, divergence and skew forms agree to the truncation error; the same on 2 ranks; single precision to round-off (≤ 2e-4) |
+| scalars, full solver | turbulent channel 32 × 65 × 100 with two scalars, compact z: 1 and 2 ranks agree to all printed digits; restart written on 1 rank, read on 2: identical; restart without scalars read with `nscal = 2` |
 | laminar Poiseuille, CFR | −dp/dx = 3/Re to all printed digits, divergence 3e-16 |
 | decay of random disturbances, Re = 200 | E′ decays monotonically, −dp/dx → 3/Re |
 | TS wave, Re = 5000, α = 1.12, tanh α_s = 4 | with HiCHAN's stencils and the advective form, HiCHAN's published errors are reproduced (2.65e-5 vs 2.6e-5 for 4th order, 3.4e-7 vs 3e-7 for 6th order, ny = 65); compact 8th order: 1.5e-7 (65), 2e-9 (97). DESIGN.md §5 |

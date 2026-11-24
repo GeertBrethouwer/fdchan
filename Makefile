@@ -108,9 +108,14 @@ build/test_ops: tests/test_ops.cpp $(HDR)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(DEFS) tests/test_ops.cpp -o $@ $(LIBS)
 
-test: build/test_ops build/test_zcompact
+build/test_scalars: tests/test_scalars.cpp $(HDR)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(DEFS) tests/test_scalars.cpp -o $@ $(LIBS)
+
+test: build/test_ops build/test_zcompact build/test_scalars
 	./build/test_ops
 	./build/test_zcompact
+	./build/test_scalars
 
 clean:
 	rm -rf build

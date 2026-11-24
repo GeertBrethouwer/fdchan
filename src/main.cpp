@@ -18,10 +18,14 @@ Comm g_comm;
 
 using namespace fd;
 
-// Restart file: header (4 ints: nx, ny, nz (global), sizeof(real); 3 doubles: lx, lz, t), then u, v, w as global
-// complex arrays (ny, nz, nkx), the same layout for any number of ranks.
+// Restart file: header (4 ints: nx, ny, nz (global), sizeof(real); 3 doubles: lx, lz, t), then u, v, w and the
+// nscal scalars as global complex arrays (ny, nz, nkx), the same layout for any number of ranks. A file with fewer
+// scalars (e.g. from a run without scalars) can be read: the missing scalars are initialised as given by sinit.
 static void write_restart(Solver& S, const std::string& file) {
-  std::vector<cplx> h[3] = {S.u.host(), S.v.host(), S.w.host()};
+  const int nf = 3 + S.nsc;
+  std::vector<std::vector<cplx>> h;
+  h.push_back(S.u.host()); h.push_back(S.v.host()); h.push_back(S.w.host());
+  for (int n = 0; n < S.nsc; ++n) h.push_back(S.Sf[n].host());
   const int hdr[4] = {S.nx, S.ny, S.nzg, int(sizeof(real))};
   const double d[3] = {S.P.lx, S.P.lz, S.time};
 #ifdef FD_MPI
@@ -40,9 +44,9 @@ static void write_restart(Solver& S, const std::string& file) {
   MPI_Type_create_subarray(3, gs, ls, st, MPI_ORDER_C, T, &sub);
   MPI_Type_commit(&sub);
   const MPI_Offset field = MPI_Offset(S.ny) * S.nzg * S.nkx * 2 * sizeof(real);
-  for (int c = 0; c < 3; ++c) {
+  for (int c = 0; c < nf; ++c) {
     MPI_File_set_view(fh, 40 + c * field, T, sub, "native", MPI_INFO_NULL);
-    MPI_File_write_all(fh, h[c].data(), int(2 * h[c].size()), T, MPI_STATUS_IGNORE);
+    MPI_File_write_all(fh, h[size_t(c)].data(), int(2 * h[size_t(c)].size()), T, MPI_STATUS_IGNORE);
   }
   MPI_Type_free(&sub);
   MPI_File_close(&fh);
@@ -54,7 +58,7 @@ static void write_restart(Solver& S, const std::string& file) {
   if (!f) fatal("cannot write restart file");
   std::fwrite(hdr, sizeof(int), 4, f);
   std::fwrite(d, sizeof(double), 3, f);
-  for (auto& a : h) std::fwrite(a.data(), sizeof(cplx), a.size(), f);
+  for (int c = 0; c < nf; ++c) std::fwrite(h[size_t(c)].data(), sizeof(cplx), h[size_t(c)].size(), f);
   std::fclose(f);
   std::rename((file + ".tmp").c_str(), file.c_str());
 #endif
@@ -63,8 +67,12 @@ static void write_restart(Solver& S, const std::string& file) {
 static void read_restart(Solver& S, const std::string& file) {
   int hdr[4];
   double d[3];
-  std::vector<cplx> h[3];
+  const int nf = 3 + S.nsc;
+  std::vector<std::vector<cplx>> h(static_cast<size_t>(nf));
   for (auto& a : h) a.resize(size_t(S.nsp));
+  const long long field = (long long)S.ny * S.nzg * S.nkx * 2 * (long long)sizeof(real);
+  long long fsize = 0;
+  int nread = 0;
 #ifdef FD_MPI
   MPI_File fh;
   if (MPI_File_open(g_comm.comm, file.c_str(), MPI_MODE_RDONLY, MPI_INFO_NULL, &fh) != MPI_SUCCESS)
@@ -73,15 +81,21 @@ static void read_restart(Solver& S, const std::string& file) {
   MPI_File_read_at_all(fh, 16, d, 3, MPI_DOUBLE, MPI_STATUS_IGNORE);
   if (hdr[0] != S.nx || hdr[1] != S.ny || hdr[2] != S.nzg || hdr[3] != int(sizeof(real)))
     fatal("restart file does not match the grid or the precision");
+  {
+    MPI_Offset sz;
+    MPI_File_get_size(fh, &sz);
+    fsize = (long long)sz;
+  }
+  nread = int(std::min<long long>(nf, (fsize - 40) / field));
+  if (nread < 3) fatal("restart file too short");
   const MPI_Datatype T = sizeof(real) == 8 ? MPI_DOUBLE : MPI_FLOAT;
   int gs[3] = {S.ny, S.nzg, 2 * S.nkx}, ls[3] = {S.ny, S.nz, 2 * S.nkx}, st[3] = {0, S.z0, 0};
   MPI_Datatype sub;
   MPI_Type_create_subarray(3, gs, ls, st, MPI_ORDER_C, T, &sub);
   MPI_Type_commit(&sub);
-  const MPI_Offset field = MPI_Offset(S.ny) * S.nzg * S.nkx * 2 * sizeof(real);
-  for (int c = 0; c < 3; ++c) {
-    MPI_File_set_view(fh, 40 + c * field, T, sub, "native", MPI_INFO_NULL);
-    MPI_File_read_all(fh, h[c].data(), int(2 * h[c].size()), T, MPI_STATUS_IGNORE);
+  for (int c = 0; c < nread; ++c) {
+    MPI_File_set_view(fh, 40 + c * MPI_Offset(field), T, sub, "native", MPI_INFO_NULL);
+    MPI_File_read_all(fh, h[size_t(c)].data(), int(2 * h[size_t(c)].size()), T, MPI_STATUS_IGNORE);
   }
   MPI_Type_free(&sub);
   MPI_File_close(&fh);
@@ -91,11 +105,26 @@ static void read_restart(Solver& S, const std::string& file) {
   if (std::fread(hdr, sizeof(int), 4, f) != 4 || std::fread(d, sizeof(double), 3, f) != 3) fatal("restart header");
   if (hdr[0] != S.nx || hdr[1] != S.ny || hdr[2] != S.nzg || hdr[3] != int(sizeof(real)))
     fatal("restart file does not match the grid or the precision");
-  for (auto& a : h)
-    if (std::fread(a.data(), sizeof(cplx), a.size(), f) != a.size()) fatal("restart data");
+  std::fseek(f, 0, SEEK_END);
+  fsize = std::ftell(f);
+  std::fseek(f, 40, SEEK_SET);
+  nread = int(std::min<long long>(nf, (fsize - 40) / field));
+  if (nread < 3) fatal("restart file too short");
+  for (int c = 0; c < nread; ++c)
+    if (std::fread(h[size_t(c)].data(), sizeof(cplx), h[size_t(c)].size(), f) != h[size_t(c)].size())
+      fatal("restart data");
   std::fclose(f);
 #endif
   S.set_fields(h[0], h[1], h[2]);
+  for (int n = 0; n < S.nsc; ++n) {
+    if (3 + n < nread) S.Sf[n].upload(h[size_t(3 + n)]);
+    else {
+      if (g_comm.root())
+        std::printf("restart: scalar %d not in %s, initialised with sinit = %s\n", n + 1, file.c_str(),
+                    S.P.sinit[n].c_str());
+      S.init_scalar(n);
+    }
+  }
   if (!S.P.reset_time) S.time = d[2];
 }
 
@@ -159,14 +188,24 @@ int main(int argc, char** argv) {
     lg = std::fopen((P.data_dir + "/log.dat").c_str(), P.init_type == "restart" ? "a" : "w");
     if (!lg) fatal("cannot open log.dat");
     std::fprintf(lg, "#    step          time            dt         ubulk  dpdx_applied         tau_w        Re_tau"
-                     "     div_max          Ekin        E_mode\n");
+                     "     div_max          Ekin        E_mode");
+    for (int n = 1; n <= S.nsc; ++n) std::fprintf(lg, "      dS%ddy_b      dS%ddy_t", n, n);
+    std::fprintf(lg, "\n");
   }
   auto log_line = [&]() {
     Solver::Log L = S.diagnostics();  // collective
+    std::vector<double> sg;            // dS/dy of the mean scalars at the bottom and top walls
+    for (int n = 0; n < S.nsc; ++n) {
+      const std::vector<double> g = S.D1.apply(S.mean_of(S.Sf[n].p));
+      sg.push_back(g[0]);
+      sg.push_back(g[size_t(S.ny - 1)]);
+    }
     if (!root) return;
-    // HiCHAN: (i9, 6es14.6, es11.3, 2es14.6)
-    std::fprintf(lg, "%9ld%14.6E%14.6E%14.6E%14.6E%14.6E%14.6E%11.3E%14.6E%14.6E\n", S.step, S.time, S.dt, L.ub,
+    // HiCHAN: (i9, 6es14.6, es11.3, 2es14.6), then 2es14.6 per scalar
+    std::fprintf(lg, "%9ld%14.6E%14.6E%14.6E%14.6E%14.6E%14.6E%11.3E%14.6E%14.6E", S.step, S.time, S.dt, L.ub,
                  S.dpdx_step, L.tau_w, L.retau, L.div, L.ef, L.emode);
+    for (double x : sg) std::fprintf(lg, "%14.6E", x);
+    std::fprintf(lg, "\n");
     std::fflush(lg);
     std::printf("step %8ld  t = %.5f  dt = %.3e  Ub = %.6f  -dp/dx = %.6e  Re_tau = %.2f  div = %.1e  E' = %.4e\n",
                 S.step, S.time, S.dt, L.ub, S.dpdx_step, L.retau, L.div, L.ef);
@@ -176,8 +215,13 @@ int main(int argc, char** argv) {
   // statistics, as HiCHAN: time-weighted averages (weight dt * iout_stats) of U V W, <u'u'> <v'v'> <w'w'> <u'v'>
   // <u'w'> <v'w'>, P and <p'p'> (P: the pressure of the last RK stage; with nl_form = rotational the total
   // pressure p + |u|^2/2). Sampled right after the step, before the log line reuses the array that holds phi.
-  const int NQ = 11;
-  static const char* qname[NQ] = {"U", "V", "W", "uu", "vv", "ww", "uv", "uw", "vw", "P", "pp"};
+  // per scalar n (as HiCHAN): S<n>, <s'_n s'_n>, <u's'_n>, <v's'_n>, <w's'_n>
+  const int NQ = 11 + 5 * S.nsc;
+  std::vector<std::string> qname = {"U", "V", "W", "uu", "vv", "ww", "uv", "uw", "vw", "P", "pp"};
+  for (int n = 1; n <= S.nsc; ++n) {
+    const std::string c = std::to_string(n);
+    for (const std::string& q : {"S" + c, "s" + c + "s" + c, "us" + c, "vs" + c, "ws" + c}) qname.push_back(q);
+  }
   std::vector<double> st(size_t(NQ) * S.ny, 0.0);
   double tsum = 0;
   long nsamp = 0;
@@ -196,6 +240,19 @@ int main(int argc, char** argv) {
       for (int q = 0; q < 6; ++q) st[o + 3 + size_t(q)] += wgt * (c[q][jj] - m[ca[q]][jj] * m[cb[q]][jj]);
       st[o + 9] += wgt * ps * pm[jj];
       st[o + 10] += wgt * ps * ps * (pp[jj] - pm[jj] * pm[jj]);
+    }
+    const cplx* F[3] = {S.u.p, S.v.p, S.w.p};
+    for (int n = 0; n < S.nsc; ++n) {
+      const cplx* sf = S.Sf[n].p;
+      const std::vector<double> sm = S.mean_of(sf), ss = S.profile_of(sf, sf);
+      std::vector<double> us[3];
+      for (int c = 0; c < 3; ++c) us[c] = S.profile_of(F[c], sf);
+      for (int j = 0; j < S.ny; ++j) {
+        const size_t jj = size_t(j), o = size_t(NQ) * jj + 11 + 5 * size_t(n);
+        st[o] += wgt * sm[jj];
+        st[o + 1] += wgt * (ss[jj] - sm[jj] * sm[jj]);
+        for (int c = 0; c < 3; ++c) st[o + 2 + size_t(c)] += wgt * (us[c][jj] - m[c][jj] * sm[jj]);
+      }
     }
     tsum += wgt;
     ++nsamp;
@@ -219,7 +276,7 @@ int main(int argc, char** argv) {
                  nsamp);
     std::fprintf(f, "# fluctuation moments are <f'g'>; P and pp are the (total, if nl_form=rotational) pressure\n");
     std::fprintf(f, "#            y");
-    for (int q = 0; q < NQ; ++q) std::fprintf(f, "%16s", qname[q]);
+    for (int q = 0; q < NQ; ++q) std::fprintf(f, "%16s", qname[size_t(q)].c_str());
     std::fprintf(f, " \n");
     for (int j = 0; j < S.ny; ++j) {
       std::string line = fes(S.y[size_t(j)], 16, 7, 3);
