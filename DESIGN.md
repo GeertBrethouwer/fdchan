@@ -209,6 +209,21 @@ local solve per component, no extra communication, continuity still exact, O(Δt
 near-wall tangential velocity; (2) exact coupling as in HiCHAN's B.2 or with a Kleiser–Schumann influence
 matrix: all three components in (kx, kz, y) space, three times the pressure transposes. Variant 1 fits this code.
 
+**Scalars (implemented, as HiCHAN).** ∂s/∂t + u·∇s = κ∇²s + Q_c + Q_u u/U_b, κ = ν/Pr, with the momentum source
+−Ri s ĝ (Boussinesq) for active scalars. The same low-storage RK as the velocity; diffusion in x and y with the
+θ-method (HiCHAN Eqs. (9)–(13)): r = s + Δt(γN + ζN_old) + (1−θ)βΔt κ(D2y − kx²)s, then (1 − θβΔtκ(D2y − kx²)) s = r.
+In z the diffusion is explicit (part of N): z is not Fourier here, and an implicit z-solve would need the
+all-to-alls per scalar and stage; its explicit limit is far less severe than the y-limit (on the production grid
+2048 × 321 × 1536 about 1/80 of the y spectral radius). The y-problem is HiCHAN's `scalar_solve`: premultiplied by
+the A of the compact D2y, H = (1 + c kx²)A − cB with identity wall rows; the unknown values τ₁, τ_N of the operator at
+the walls (and the wall values of s for Neumann walls, ∂s/∂y given through the first and last row of D1) follow from
+a 2 × 2 (Dirichlet) or 4 × 4 influence-matrix system. H depends only on kx, so per kx and stage: banded LU of H
+(no pivoting, diagonally dominant), four homogeneous solutions and the inverse influence matrix (`scalar_factor`,
+nkx threads); per (kx, z) line one substitution and the combination (`scalar_lines`). The wall values are uniform
+along the wall (they enter the kx = 0 lines at every z). Time-step limits as
+HiCHAN: the diffusive limit with (1 − 2θ)₊κ in x and y and κ in z, and |λ| ≤ N with N² = |Ri| max|dS/dy| of the
+mean profile (internal waves).
+
 ## 5. Accuracy
 
 **Tollmien–Schlichting wave**, Re = 5000 (centreline), α = 1.12, the test of Lenaers et al. Sec. 5.1 and
@@ -273,6 +288,8 @@ stable through transition, not which is more accurate.
 CPU cost (Intel i5): explicit 6th alone on 4 threads 0.14 s per step; the two compact runs ran at the same
 time on 2 threads each, 0.31 s (6th) and 0.32 s (8th) per step, of which the pressure step took 20 % and 27 %.
 The CPU FFT is a simple one written for testing; on the GPU, cuFFT replaces it.
+
+Scalars: `tests/test_scalars.cpp` (README, Tests).
 
 Not yet tested: the CUDA and HIP builds (never compiled), multi-GPU, comparison with HiCHAN on the same case at
 production resolution.

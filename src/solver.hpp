@@ -43,6 +43,7 @@ namespace fd {
 
 constexpr int MAXW = 12;  // max stencil width stored per row
 constexpr int MAXP2 = 4;  // max half width of the z stencils (order 8)
+constexpr int MAXB = 24;  // max band width (kl + ku + 1) of the scalar y-systems
 
 struct ZSt {  // periodic central stencils in z, a[l + h], l = -h..h, already divided by dz (dz^2)
   int h;
@@ -160,6 +161,9 @@ struct RhsPoint {
   ZSt z;
   int nkx, nz, ny;
   real sc, nuu, dtg, dtz, force;
+  int nb = 0;              // Boussinesq buoyancy: - Ri_n g_c s_n of the scalars (bco = -Ri_n g_c)
+  const cplx* bs[NSMAX];
+  real bco[NSMAX];
   HD void operator()(idx n, idx o, int i, int k, int j, cplx d2y) const {
     if (j == 0 || j == ny - 1) {
       r[o] = cplx(0, 0);
@@ -173,6 +177,7 @@ struct RhsPoint {
       for (int l = -z.h; l <= z.h; ++l) lap += z.a2[l + z.h] * zv(f, hf, nkx, i, k + l, j, nz, z.h, ny, nkx);
     cplx hh = sc * r[o] + nuu * lap;
     if (i == 0) hh.re += force;
+    for (int q = 0; q < nb; ++q) hh += bco[q] * bs[q][n];
     r[o] = fc + dtg * hh + dtz * h[n];
     h[n] = hh;
   }
@@ -229,6 +234,15 @@ class Solver {
   DArray<real> d_zcp[2], d_zinv[2], d_zpv[2], d_zqv[2];
   DArray<cplx> DZ1, DZ2, d_zx;  // compact z: block solutions y; first/last values of the lines for the exchange
   DArray<cplx> ZB1, ZB2;        // compact z: x_{-1}, x_n per line of DZ1, DZ2
+  // scalars (P.nscal): fields, explicit right-hand sides of this and the previous stage, diffusivities
+  int nsc = 0;
+  DArray<cplx> Sf[NSMAX], NSf[NSMAX], NSo[NSMAX];
+  DArray<cplx> hbS;  // halo of the scalar being processed
+  double kap[NSMAX] = {0}, gvec[3] = {0, 0, 0};
+  // scalar y-solve (theta-method): band of A2 and B2 per row (offsets -skl..sku), the wall rows of D1, and per kx the
+  // banded LU (U rows, multipliers), the 4 homogeneous solutions and the inverse influence matrix
+  int skl = 0, sku = 0, snb = 0, nc1 = 0, ncn = 0;
+  DArray<real> d_a2b, d_b2b, d_c1, d_cn, d_sU, d_sL, d_sX, d_sE;
   // device arrays
   struct YDev {  // a y derivative on the device
     const int* s;
@@ -243,7 +257,7 @@ class Solver {
   DArray<unsigned char> d_sp;   // their pivot choices
   bool factored = false;
   DArray<cplx> u, v, w, hx, hy, hz_, T1, T2;
-  DArray<real> Pb[9];  // 6 always, 3 more for the advective form
+  DArray<real> Pb[10];  // 6 always, 3 more for the advective form or the scalars, 1 more for scalar_form divergence/skew
   DArray<double> d_prof, d_scal;
   DArray<cplx> hbA, hbB, hbC, hsend, sbuf, rbuf;  // halo buffers, transpose buffers
   DArray<int> d_kxown, d_kxoff, d_zown, d_zoff;
@@ -286,7 +300,12 @@ class Solver {
     if (P.nl_form != "rotational" && P.nl_form != "advective") fatal("FDCHAN: nl_form must be rotational or advective");
     if (P.rk_stages != 3 && P.rk_stages != 4) fatal("FDCHAN: rk_stages must be 3 or 4");
     setup_operators();
-    for (int c = 0; c < (P.nl_form == "advective" ? 9 : 6); ++c) Pb[c].alloc(npad);
+    nsc = P.nscal;
+    {
+      int npb = (P.nl_form == "advective" || nsc > 0) ? 9 : 6;
+      if (nsc > 0 && P.scal_form != "advective") npb = 10;
+      for (int c = 0; c < npb; ++c) Pb[c].alloc(npad);
+    }
     u.alloc(nsp); v.alloc(nsp); w.alloc(nsp);
     hx.alloc(nsp); hy.alloc(nsp); hz_.alloc(nsp);
     T1.alloc(nsp);
@@ -296,6 +315,13 @@ class Solver {
     rbuf.alloc(std::max(nsp, nt2));
     const idx nh = 2 * idx(hz_halo) * ny * nkx;
     hbA.alloc(nh); hbB.alloc(nh); hbC.alloc(nh); hsend.alloc(nh);
+    if (nsc > 0) {
+      hbS.alloc(nh);
+      for (int n = 0; n < nsc; ++n) { Sf[n].alloc(nsp); NSf[n].alloc(nsp); NSo[n].alloc(nsp); kap[n] = nu / P.pr[n]; }
+      const double gn = std::sqrt(P.gravity[0] * P.gravity[0] + P.gravity[1] * P.gravity[1] + P.gravity[2] * P.gravity[2]);
+      for (int c = 0; c < 3; ++c) gvec[c] = P.gravity[c] / gn;
+      setup_scalar_solve();
+    }
     setup_transpose();
     d_su.alloc(idx(2 * K + 1) * 2 * ny * ncols);
     d_sy.alloc(idx(NRHS) * 2 * ny * ncols);
@@ -701,10 +727,375 @@ class Solver {
     std::printf("pressure  band K = %d, %lld columns of length %d (phi and D1 phi)\n", K, ncols, 2 * ny);
     std::printf("viscous   spectral radii: kx^2 %.3e, D2z %.3e, D2y %.3e\n", kxmax() * kxmax(), lam2z, lam2y);
     const double mb = double(sizeof(real)) / 1048576.0;
-    const double tot = (6.0 * npad + 2.0 * (11 + (zcomp ? 2 : 0)) * nsp + (3.0 * K + 1.0 + NRHS) * 2 * ny * ncols) * mb +
+    int npb = 0;
+    for (const auto& b : Pb) npb += (b.n > 0);
+    const double tot = (double(npb) * npad + 2.0 * (11 + (zcomp ? 2 : 0) + 3 * nsc) * nsp + (3.0 * K + 1.0 + NRHS) * 2 * ny * ncols) * mb +
                        2.0 * ny * ncols / 1048576.0;
+    if (nsc > 0)
+      std::printf("scalars   %d, %s form; implicit y-systems: band %d+%d, Neumann rows of D1 with %d/%d entries\n", nsc,
+                  P.scal_form.c_str(), skl, sku, nc1, ncn);
     std::printf("memory    %.1f MB of field arrays on rank 0 (%.0f bytes per local grid point)\n", tot,
                 tot * 1048576.0 / (double(nx) * ny * nz));
+  }
+
+  // ---------------------------------------------------------------- scalars (as HiCHAN)
+  // Transport  ds/dt + u.grad s = kappa Lap s + Q_c + Q_u u/ubulk,  kappa = nu/Pr, with Dirichlet (s = g) or Neumann
+  // (ds/dy = g) walls (g only for the x-mean, kx = 0). Low-storage RK as the velocity; the diffusion in x and y with
+  // the theta-method (scal_theta; HiCHAN: Eqs. (9)-(13), B.2), the diffusion in z explicit (fdchan is not Fourier in z;
+  // its explicit z-diffusion limit is far above the y-limit). The implicit y-solve is HiCHAN's scalar_solve:
+  // premultiplied by A2, H = (1 + c kx^2) A2 - c B2 with identity wall rows, and the unknown wall values tau_1, tau_N
+  // of the operator (and the wall values of s for Neumann walls) from a small influence-matrix system. H depends on
+  // kx only: its LU, the homogeneous solutions and the inverse influence matrix are computed once per kx and stage.
+  void setup_scalar_solve() {
+    // band of A2 (tridiagonal, unit diagonal) and B2 per row, offsets o = col - row in [-skl, sku]
+    skl = 1; sku = 1;
+    for (int j = 0; j < ny; ++j) {
+      skl = std::max(skl, j - D2.B.s[size_t(j)]);
+      sku = std::max(sku, D2.B.s[size_t(j)] + D2.B.W - 1 - j);
+    }
+    snb = skl + sku + 1;
+    if (snb > MAXB) fatal("scalar y-system: band too wide");
+    std::vector<double> a2b(size_t(ny) * snb, 0.0), b2b(size_t(ny) * snb, 0.0);
+    for (int j = 0; j < ny; ++j) {
+      a2b[size_t(j * snb + skl)] = 1.0;
+      if (D2.compact) {
+        if (j > 0) a2b[size_t(j * snb + skl - 1)] = D2.lo[size_t(j)];
+        if (j < ny - 1) a2b[size_t(j * snb + skl + 1)] = D2.up[size_t(j)];
+      }
+      for (int m = 0; m < D2.B.W; ++m) {
+        const int col = D2.B.s[size_t(j)] + m;
+        b2b[size_t(j * snb + col - j + skl)] += D2.B.c[size_t(j * D2.B.W + m)];
+      }
+    }
+    auto tor = [](const std::vector<double>& x) { return std::vector<real>(x.begin(), x.end()); };
+    d_a2b.alloc(idx(a2b.size())); d_a2b.upload(tor(a2b));
+    d_b2b.alloc(idx(b2b.size())); d_b2b.upload(tor(b2b));
+    // first and last rows of D1 (dense for compact schemes): the Neumann conditions and the wall gradients
+    std::vector<double> c1(static_cast<size_t>(ny)), cn(static_cast<size_t>(ny)), e(static_cast<size_t>(ny), 0.0);
+    for (int r = 0; r < ny; ++r) {
+      e[size_t(r)] = 1;
+      std::vector<double> d = D1.apply(e);
+      c1[size_t(r)] = d[0]; cn[size_t(r)] = d[size_t(ny - 1)];
+      e[size_t(r)] = 0;
+    }
+    double m1 = 0, mn = 0;
+    for (int r = 0; r < ny; ++r) { m1 = std::max(m1, std::abs(c1[size_t(r)])); mn = std::max(mn, std::abs(cn[size_t(r)])); }
+    nc1 = 1; ncn = 1;
+    for (int r = 0; r < ny; ++r) {
+      if (std::abs(c1[size_t(r)]) > 1e-15 * m1) nc1 = r + 1;
+      if (std::abs(cn[size_t(ny - 1 - r)]) > 1e-15 * mn) ncn = r + 1;
+    }
+    d_c1.alloc(ny); d_c1.upload(tor(c1));
+    d_cn.alloc(ny); d_cn.upload(tor(cn));
+    d_sU.alloc(idx(nkx) * ny * (sku + 1));
+    d_sL.alloc(idx(nkx) * ny * std::max(skl, 1));
+    d_sX.alloc(idx(nkx) * 4 * ny);
+    d_sE.alloc(idx(nkx) * 16);
+  }
+
+  // per kx: LU of H = (1 + c kx^2) A2 - c B2 (wall rows identity), the homogeneous solutions X_m (m = 0: tau_1,
+  // 1: tau_N, 2: s(-1) = 1, 3: s(+1) = 1) and the inverse of the influence matrix (2x2 Dirichlet, else 4x4)
+  void scalar_factor(double c, bool isnb, bool isnt) {
+    const int ny_ = ny, nkx_ = nkx, kl = skl, ku = sku, nb = snb, nc1_ = nc1, ncn_ = ncn;
+    const real *a2b = d_a2b.p, *b2b = d_b2b.p, *kxv = d_kx.p, *c1 = d_c1.p, *cn = d_cn.p;
+    real *U = d_sU.p, *Lm = d_sL.p, *X = d_sX.p, *E = d_sE.p;
+    const real cr = real(c);
+    const bool isd = !(isnb || isnt);
+    pfor_lines(nkx_, [=] HD(idx ii) {
+      const int i = int(ii);
+      const real ca = real(1) + cr * kxv[i] * kxv[i], cb = -cr;
+      auto Ui = [&](int r, int q) -> real& { return U[(idx(r) * (ku + 1) + q) * nkx_ + i]; };
+      auto Li = [&](int r, int q) -> real& { return Lm[(idx(r) * (kl > 0 ? kl : 1) + (q - 1)) * nkx_ + i]; };
+      auto Xi = [&](int m, int r) -> real& { return X[(idx(m) * ny_ + r) * nkx_ + i]; };
+      auto hrow = [&](int r, int o) { return ca * a2b[r * nb + o + kl] + cb * b2b[r * nb + o + kl]; };
+      real row[MAXB];
+      for (int r = 0; r < ny_; ++r) {
+        for (int o = -kl; o <= ku; ++o) row[o + kl] = (r == 0 || r == ny_ - 1) ? (o == 0 ? real(1) : real(0)) : hrow(r, o);
+        for (int l = (r - kl > 0 ? r - kl : 0); l < r; ++l) {
+          const int o = l - r;
+          real f = 0;
+          if (row[o + kl] != real(0)) {
+            f = row[o + kl] / Ui(l, 0);
+            for (int q = 1; q <= ku; ++q)
+              if (o + q <= ku) row[o + q + kl] -= f * Ui(l, q);
+          }
+          Li(r, r - l) = f;
+        }
+        for (int q = 0; q <= ku; ++q) Ui(r, q) = row[q + kl];
+      }
+      real e[4][5] = {};
+      for (int m = 0; m < 4; ++m) {
+        for (int r = 0; r < ny_; ++r) Xi(m, r) = 0;
+        if (m == 0) Xi(m, 1) = a2b[1 * nb - 1 + kl];
+        if (m == 1) Xi(m, ny_ - 2) = a2b[(ny_ - 2) * nb + 1 + kl];
+        if (m == 2) Xi(m, 0) = 1;
+        if (m == 3) Xi(m, ny_ - 1) = 1;
+        for (int r = 0; r < ny_; ++r) {
+          real y = Xi(m, r);
+          for (int q = 1; q <= kl && q <= r; ++q) y -= Li(r, q) * Xi(m, r - q);
+          Xi(m, r) = y;
+        }
+        for (int r = ny_ - 1; r >= 0; --r) {
+          real x = Xi(m, r);
+          for (int q = 1; q <= ku && r + q < ny_; ++q) x -= Ui(r, q) * Xi(m, r + q);
+          Xi(m, r) = x / Ui(r, 0);
+        }
+        real h0 = 0, hn = 0;
+        for (int o = 0; o <= ku && o < ny_; ++o) h0 += hrow(0, o) * Xi(m, o);
+        for (int o = -kl; o <= 0; ++o)
+          if (ny_ - 1 + o >= 0) hn += hrow(ny_ - 1, o) * Xi(m, ny_ - 1 + o);
+        e[0][m + 1] = h0 - (m == 0 ? real(1) : real(0));
+        e[1][m + 1] = hn - (m == 1 ? real(1) : real(0));
+        real f3 = 0, f4 = 0;
+        for (int r = 0; r < nc1_; ++r) f3 += c1[r] * Xi(m, r);
+        for (int r = ny_ - ncn_; r < ny_; ++r) f4 += cn[r] * Xi(m, r);
+        e[2][m + 1] = isnb ? f3 : (m == 2 ? real(1) : real(0));
+        e[3][m + 1] = isnt ? f4 : (m == 3 ? real(1) : real(0));
+      }
+      // inverse of the influence matrix (columns m = 0..3), stored row-major in E[q * 4 + l]
+      real inv[4][4];
+      for (int q = 0; q < 4; ++q)
+        for (int l = 0; l < 4; ++l) inv[q][l] = 0;
+      if (isd) {
+        const real a = e[0][1], b = e[0][2], cc = e[1][1], d = e[1][2], det = a * d - b * cc;
+        inv[0][0] = d / det; inv[0][1] = -b / det; inv[1][0] = -cc / det; inv[1][1] = a / det;
+      } else {
+        real Mx[4][8];
+        for (int q = 0; q < 4; ++q)
+          for (int l = 0; l < 4; ++l) { Mx[q][l] = e[q][l + 1]; Mx[q][l + 4] = (q == l) ? real(1) : real(0); }
+        for (int q = 0; q < 4; ++q) {
+          int p = q;
+          for (int l = q + 1; l < 4; ++l)
+            if ((Mx[l][q] < 0 ? -Mx[l][q] : Mx[l][q]) > (Mx[p][q] < 0 ? -Mx[p][q] : Mx[p][q])) p = l;
+          if (p != q)
+            for (int l = 0; l < 8; ++l) { const real t = Mx[q][l]; Mx[q][l] = Mx[p][l]; Mx[p][l] = t; }
+          const real piv = Mx[q][q];
+          for (int l = 0; l < 8; ++l) Mx[q][l] /= piv;
+          for (int r = 0; r < 4; ++r)
+            if (r != q) {
+              const real f = Mx[r][q];
+              for (int l = 0; l < 8; ++l) Mx[r][l] -= f * Mx[q][l];
+            }
+        }
+        for (int q = 0; q < 4; ++q)
+          for (int l = 0; l < 4; ++l) inv[q][l] = Mx[q][l + 4];
+      }
+      for (int q = 0; q < 4; ++q)
+        for (int l = 0; l < 4; ++l) E[(idx(q) * 4 + l) * nkx_ + i] = inv[q][l];
+    });
+  }
+
+  // the implicit solve of every (kx, z) line of f: on input r, on output s; gb, gt the wall values (Dirichlet) or wall
+  // gradients (Neumann) of the x-mean
+  void scalar_lines(cplx* f, double c, bool isnb, bool isnt, double gb_, double gt_) {
+    const int ny_ = ny, nkx_ = nkx, nz_ = nz, kl = skl, ku = sku, nb = snb, nc1_ = nc1, ncn_ = ncn;
+    const real *a2b = d_a2b.p, *b2b = d_b2b.p, *kxv = d_kx.p, *c1 = d_c1.p, *cn = d_cn.p;
+    const real *U = d_sU.p, *Lm = d_sL.p, *X = d_sX.p, *E = d_sE.p;
+    const real cr = real(c), gb = real(gb_), gt = real(gt_);
+    const bool isd = !(isnb || isnt);
+    const idx st = idx(nz_) * nkx_;
+    pfor_lines(idx(nz_) * nkx_, [=] HD(idx ln) {
+      const int i = int(ln % nkx_);
+      cplx* F = f + ln;  // F[j * st]
+      const real ca = real(1) + cr * kxv[i] * kxv[i], cb = -cr;
+      auto hrow = [&](int r, int o) { return ca * a2b[r * nb + o + kl] + cb * b2b[r * nb + o + kl]; };
+      auto Ui = [&](int r, int q) { return U[(idx(r) * (ku + 1) + q) * nkx_ + i]; };
+      auto Li = [&](int r, int q) { return Lm[(idx(r) * (kl > 0 ? kl : 1) + (q - 1)) * nkx_ + i]; };
+      auto Xi = [&](int m, int r) { return X[(idx(m) * ny_ + r) * nkx_ + i]; };
+      const cplx zero(0, 0);
+      // r~ = r with zero wall values; A2 r~ in the interior rows, the wall rows the Dirichlet values of the x-mean
+      const cplx r1 = F[1 * st], rn = F[idx(ny_ - 2) * st];
+      const cplx ra1 = a2b[0 * nb + 1 + kl] * r1, ran = a2b[(ny_ - 1) * nb - 1 + kl] * rn;
+      cplx prev = zero, cur = zero;  // r~_{j-1}, r~_j (original values)
+      for (int j = 0; j < ny_; ++j) {
+        const cplx nxt = (j + 1 <= ny_ - 2) ? F[idx(j + 1) * st] : zero;
+        if (j > 0 && j < ny_ - 1) cur = F[idx(j) * st];
+        cplx sx;
+        if (j == 0) sx = (i == 0 && !isnb) ? cplx(gb, 0) : zero;
+        else if (j == ny_ - 1) sx = (i == 0 && !isnt) ? cplx(gt, 0) : zero;
+        else sx = a2b[j * nb - 1 + kl] * prev + cur + a2b[j * nb + 1 + kl] * nxt;
+        for (int q = 1; q <= kl && q <= j; ++q) sx -= Li(j, q) * F[idx(j - q) * st];
+        F[idx(j) * st] = sx;
+        prev = cur;
+        cur = zero;
+      }
+      for (int j = ny_ - 1; j >= 0; --j) {
+        cplx x = F[idx(j) * st];
+        for (int q = 1; q <= ku && j + q < ny_; ++q) x -= Ui(j, q) * F[idx(j + q) * st];
+        F[idx(j) * st] = (real(1) / Ui(j, 0)) * x;
+      }
+      // the conditions of the particular solution
+      cplx e1[4] = {zero, zero, zero, zero};
+      for (int o = 0; o <= ku && o < ny_; ++o) e1[0] += hrow(0, o) * F[idx(o) * st];
+      for (int o = -kl; o <= 0; ++o)
+        if (ny_ - 1 + o >= 0) e1[1] += hrow(ny_ - 1, o) * F[idx(ny_ - 1 + o) * st];
+      e1[0] -= ra1;
+      e1[1] -= ran;
+      if (isnb) {
+        for (int r = 0; r < nc1_; ++r) e1[2] += c1[r] * F[idx(r) * st];
+        if (i == 0) e1[2].re -= gb;
+      }
+      if (isnt) {
+        for (int r = ny_ - ncn_; r < ny_; ++r) e1[3] += cn[r] * F[idx(r) * st];
+        if (i == 0) e1[3].re -= gt;
+      }
+      cplx zz[4] = {zero, zero, zero, zero};
+      const int nq = isd ? 2 : 4;
+      for (int q = 0; q < nq; ++q)
+        for (int l = 0; l < nq; ++l) zz[q] -= E[(idx(q) * 4 + l) * nkx_ + i] * e1[l];
+      for (int j = 0; j < ny_; ++j) {
+        cplx x = F[idx(j) * st];
+        for (int m = 0; m < nq; ++m) x += Xi(m, j) * zz[m];
+        F[idx(j) * st] = x;
+      }
+    });
+  }
+
+  // explicit right-hand side of the scalars (called at the end of nonlinear(): u, v, w in physical space in P0..P2):
+  // NS = -fa u.grad(s) - (1 - fa) div(u s) + Q_c + Q_u u/ubulk + kappa D2z s (+ kappa (D2y - kx^2) s if theta = 0)
+  void scalar_nonlinear() {
+    if (nsc == 0) return;
+    const int nkx_ = nkx, lp_ = lp, ld_ = ld, mx_ = mx, nz_ = nz, ny_ = ny;
+    const real sc = real(1.0 / mx);
+    const real* kxv = d_kx.p;
+    const ZSt z = zs;
+    const real fa = (P.scal_form == "divergence") ? real(0) : (P.scal_form == "skew") ? real(0.5) : real(1);
+    cplx *G0 = reinterpret_cast<cplx*>(Pb[6].p), *G1 = reinterpret_cast<cplx*>(Pb[7].p), *G2 = reinterpret_cast<cplx*>(Pb[8].p);
+    const real *pu = Pb[0].p, *pv = Pb[1].p, *pw = Pb[2].p;
+    for (int n = 0; n < nsc; ++n) {
+      const cplx* S = Sf[n].p;
+      cplx* NS = NSf[n].p;
+      const real kp = real(kap[n]), qc = real(P.ssrc_const[n]), qu = real(P.ssrc_u[n] / P.ubulk);
+      const bool expl = (P.scal_theta[n] == 0);
+      halo(S, nkx_, hbS.p);
+      const cplx* hS = hbS.p;
+      ZDer dzs, d2zs;
+      if (zcomp) {
+        dzs = zderiv(0, S, nkx_, hS, DZ1.p, ZB1.p);
+        d2zs = zderiv(1, S, nkx_, hS, DZ2.p, ZB2.p);
+      }
+      // advective part and the sources, in physical space
+      if (fa > 0) ydiff(0, S, T1.p);
+      const cplx* dys = T1.p;
+      pfor(idx(lp_) * nz_ * ny_, [=] HD(idx m) {
+        const int i = int(m % lp_);
+        const idx kj = m / lp_;
+        if (i >= nkx_ || fa == real(0)) { G0[m] = cplx(0, 0); G1[m] = cplx(0, 0); G2[m] = cplx(0, 0); return; }
+        const int k = int(kj % nz_), j = int(kj / nz_);
+        const idx s = kj * nkx_ + i;
+        cplx dz(0, 0);
+        if (dzs.valid()) dz = dzs.at(j, k, i);
+        else
+          for (int l = -z.h; l <= z.h; ++l) {
+            if (l == 0) continue;
+            dz += z.a1[l + z.h] * zv(S, hS, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
+          }
+        cplx dx = itimes(kxv[i], S[s]), dy = dys[s];
+        if (i == 0) { dx.im = 0; dy.im = 0; dz.im = 0; }
+        G0[m] = dx; G1[m] = dy; G2[m] = dz;
+      });
+      if (fa > 0)
+        for (int c = 6; c < 9; ++c) xfft.backward(Pb[c].p);
+      {
+        real *gx = Pb[6].p, *gy = Pb[7].p, *gz = Pb[8].p;
+        pfor(idx(mx_) * nz_ * ny_, [=] HD(idx m) {
+          const idx o = (m / mx_) * ld_ + (m % mx_);
+          real a = qc + qu * pu[o];
+          if (fa > real(0)) a -= fa * (pu[o] * gx[o] + pv[o] * gy[o] + pw[o] * gz[o]);
+          gx[o] = a;
+        });
+      }
+      xfft.forward(Pb[6].p);
+      // NS = sc * (forward FFT) + explicit diffusion
+      if (expl) ydiff(1, S, T2.p);
+      const cplx* d2y = T2.p;
+      pfor(nsp, [=] HD(idx s) {
+        const int i = int(s % nkx_);
+        const idx kj = s / nkx_;
+        const int k = int(kj % nz_), j = int(kj / nz_);
+        cplx d2z(0, 0);
+        if (d2zs.valid()) d2z = d2zs.at(j, k, i);
+        else
+          for (int l = -z.h; l <= z.h; ++l) d2z += z.a2[l + z.h] * zv(S, hS, nkx_, i, k + l, j, nz_, z.h, ny_, nkx_);
+        cplx h = sc * G0[kj * lp_ + i] + kp * d2z;
+        if (expl) h += kp * (d2y[s] - (kxv[i] * kxv[i]) * S[s]);
+        if (i == 0) h.im = 0;
+        NS[s] = h;
+      });
+      // divergence part -(1 - fa) div(u s): s in physical space, the fluxes back, i kx F_x + D1y F_y + D1z F_z
+      if (fa < real(1)) {
+        cplx* SP = reinterpret_cast<cplx*>(Pb[9].p);
+        pfor(idx(lp_) * nz_ * ny_, [=] HD(idx m) {
+          const int i = int(m % lp_);
+          if (i >= nkx_) { SP[m] = cplx(0, 0); return; }
+          cplx a = S[(m / lp_) * nkx_ + i];
+          if (i == 0) a.im = 0;
+          SP[m] = a;
+        });
+        xfft.backward(Pb[9].p);
+        {
+          const real* ps = Pb[9].p;
+          real *fx = Pb[6].p, *fy = Pb[7].p, *fz = Pb[8].p;
+          pfor(idx(mx_) * nz_ * ny_, [=] HD(idx m) {
+            const idx o = (m / mx_) * ld_ + (m % mx_);
+            fx[o] = pu[o] * ps[o]; fy[o] = pv[o] * ps[o]; fz[o] = pw[o] * ps[o];
+          });
+        }
+        for (int c = 6; c < 9; ++c) xfft.forward(Pb[c].p);
+        cplx* t1 = T1.p;
+        pfor(nsp, [=] HD(idx s) { t1[s] = sc * G1[(s / nkx_) * lp_ + (s % nkx_)]; });
+        ydiff(0, T1.p, T2.p);
+        halo(G2, lp_, hbS.p);
+        ZDer dzf;
+        if (zcomp) dzf = zderiv(0, G2, lp_, hbS.p, DZ1.p, ZB1.p);
+        const cplx* dyf = T2.p;
+        const cplx* hF = hbS.p;
+        const real cf = fa - real(1);
+        pfor(nsp, [=] HD(idx s) {
+          const int i = int(s % nkx_);
+          const idx kj = s / nkx_;
+          const int k = int(kj % nz_), j = int(kj / nz_);
+          cplx dz(0, 0);
+          if (dzf.valid()) dz = dzf.at(j, k, i);
+          else
+            for (int l = -z.h; l <= z.h; ++l) {
+              if (l == 0) continue;
+              dz += z.a1[l + z.h] * zv(G2, hF, lp_, i, k + l, j, nz_, z.h, ny_, nkx_);
+            }
+          cplx d = itimes(kxv[i], sc * G0[kj * lp_ + i]) + dyf[s] + sc * dz;
+          if (i == 0) d.im = 0;
+          NS[s] += cf * d;
+        });
+      }
+    }
+  }
+
+  // r = s + dt (gam NS + zet NS_old) + (1 - theta) beta dt kappa (D2y - kx^2) s, then the theta-method solve
+  void scalar_update(double dtg_, double dtz_) {
+    if (nsc == 0) return;
+    g_timer.tic(tm_ssolve);
+    const int nkx_ = nkx;
+    const real* kxv = d_kx.p;
+    for (int n = 0; n < nsc; ++n) {
+      const double th = P.scal_theta[n], dtb = dtg_ + dtz_;
+      const real dtg = real(dtg_), dtz = real(dtz_), ce = real((1 - th) * dtb * kap[n]);
+      cplx *S = Sf[n].p, *NS = NSf[n].p, *NO = NSo[n].p;
+      if (th > 0) ydiff(1, S, T2.p);
+      const cplx* d2y = T2.p;
+      const bool imp = th > 0;
+      pfor(nsp, [=] HD(idx s) {
+        const int i = int(s % nkx_);
+        cplx r = S[s] + dtg * NS[s] + dtz * NO[s];
+        if (imp) r += ce * (d2y[s] - (kxv[i] * kxv[i]) * S[s]);
+        S[s] = r;
+      });
+      std::swap(NSf[n].p, NSo[n].p);  // NS of this stage becomes NS_old
+      const bool isnb = P.sbc_bot[n] == "N", isnt = P.sbc_top[n] == "N";
+      const double c = th * dtb * kap[n];
+      scalar_factor(c, isnb, isnt);
+      scalar_lines(S, c, isnb, isnt, P.sval_bot[n], P.sval_top[n]);
+    }
+    g_timer.toc(tm_ssolve);
   }
 
   // ---------------------------------------------------------------- RK3 step
@@ -724,6 +1115,9 @@ class Solver {
     for (int s = 0; s < ns; ++s) {
       g_timer.tic(tm_nl);
       nonlinear();
+      g_timer.tic(tm_snl);
+      scalar_nonlinear();
+      g_timer.toc(tm_snl);
       g_timer.toc(tm_nl);
       if (s == 0) {
         g_timer.tic(tm_dt);
@@ -741,6 +1135,7 @@ class Solver {
         cfr_correct();
         g_timer.toc(tm_cfr);
       }
+      scalar_update(gam[s] * dt, zet[s] * dt);
     }
     // u = r - grad phi with r = u + dt (gam H + zet H_old): phi = (gam + zet) dt p for the last stage
     pscale = 1.0 / ((gam[ns - 1] + zet[ns - 1]) * dt);
@@ -943,8 +1338,22 @@ class Solver {
     });
     const double dta = P.cfl / std::max(g_comm.allmax(cmax), 1e-12);
     const double kxm2 = kxmax();
-    const double dtv = P.cfl_visc / (nu * (kxm2 * kxm2 + lam2z + lam2y));
+    // scalars: the theta-method in x, y is unconditionally stable for theta >= 1/2, the explicit part has the
+    // diffusivity (1 - 2 theta) kappa; the z-diffusion is always explicit
+    double dm = nu * (kxm2 * kxm2 + lam2z + lam2y);
+    for (int n = 0; n < nsc; ++n)
+      dm = std::max(dm, kap[n] * (std::max(0.0, 1 - 2 * P.scal_theta[n]) * (kxm2 * kxm2 + lam2y) + lam2z));
+    const double dtv = P.cfl_visc / dm;
     double d = std::min({dta, dtv, P.dt_max});
+    // internal gravity waves (as HiCHAN): |lambda| <= N, N^2 = |Ri| max |dS/dy| of the mean profile
+    for (int n = 0; n < nsc; ++n)
+      if (P.ri[n] != 0) {
+        const std::vector<double> g = D1.apply(mean_of(Sf[n].p));
+        double gm = 0;
+        for (double x : g) gm = std::max(gm, std::abs(x));
+        const double N = std::sqrt(std::abs(P.ri[n]) * gm);
+        if (N > 0) d = std::min(d, P.cfl / N);
+      }
     if (step > 0) d = std::min(d, P.dt_growth * dt);
     dt = d;
   }
@@ -973,6 +1382,8 @@ class Solver {
       pt.f = f; pt.hf = hf; pt.h = h; pt.r = r; pt.kx = kx; pt.z = z;
       pt.nkx = nkx_; pt.nz = nz_; pt.ny = ny_;
       pt.sc = sc; pt.nuu = nuu; pt.dtg = dtg; pt.dtz = dtz; pt.force = force;
+      for (int q = 0; q < nsc; ++q)
+        if (P.ri[q] != 0 && gvec[c] != 0) { pt.bs[pt.nb] = Sf[q].p; pt.bco[pt.nb] = real(-P.ri[q] * gvec[c]); ++pt.nb; }
       if (zcomp) {  // compact z: D2z f first
         pt.d2z = zderiv(1, f, nkx_, hf, DZ1.p, ZB1.p);
       }
@@ -1338,6 +1749,50 @@ class Solver {
     set_fields(hu, hv, hw);
     project_current();
     if (P.forcing == "cfr") cfr_correct();
+    for (int n = 0; n < nsc; ++n) init_scalar(n);
+  }
+
+  // initial scalar n (sinit, as HiCHAN): linear (the conduction profile if both walls are Dirichlet, else zero),
+  // zero, or noise (linear plus random large-scale modes |kx index| <= 4, |kz index| <= 4, (1 - y^2) times a
+  // random quadratic in y, of rms init_amp)
+  void init_scalar(int n) {
+    std::vector<cplx> hs(size_t(nsp), cplx(0, 0));
+    auto at = [&](int i, int k, int j) { return size_t((idx(j) * nz + k) * nkx + i); };
+    if (P.sinit[n] != "zero" && P.sbc_bot[n] == "D" && P.sbc_top[n] == "D")
+      for (int j = 0; j < ny; ++j) {
+        const double yy = y[size_t(j)], sl = 0.5 * (P.sval_bot[n] * (1 - yy) + P.sval_top[n] * (1 + yy));
+        for (int k = 0; k < nz; ++k) hs[at(0, k, j)] = cplx(real(sl), 0);
+      }
+    if (P.sinit[n] == "noise") {
+      std::mt19937 g(unsigned(P.init_seed + 1000 * (n + 1)));
+      std::normal_distribution<double> N(0, 1);
+      std::vector<std::complex<double>> ps(static_cast<size_t>(nsp), 0.0);
+      for (int i = 0; i <= std::min(4, nkx - 1); ++i)
+        for (int m = -4; m <= 4; ++m) {
+          if (i == 0 && m <= 0) continue;
+          const double be = 2 * M_PI * m / P.lz;
+          std::complex<double> a[3];
+          for (int c = 0; c < 3; ++c) a[c] = {N(g), N(g)};
+          for (int j = 1; j < ny - 1; ++j) {
+            const double yy = y[size_t(j)];
+            const std::complex<double> f = (1 - yy * yy) * (a[0] + a[1] * yy + a[2] * (2 * yy * yy - 1));
+            for (int k = 0; k < nz; ++k) {
+              std::complex<double> v = std::polar(1.0, be * (k + z0) * hz) * f;
+              if (i == 0) v = 2.0 * v.real();
+              ps[at(i, k, j)] += v;
+            }
+          }
+        }
+      double ms = 0;
+      for (int j = 0; j < ny; ++j)
+        for (int k = 0; k < nz; ++k)
+          for (int i = 0; i < nkx; ++i) ms += q[size_t(j)] * (i == 0 ? 1.0 : 2.0) * std::norm(ps[at(i, k, j)]);
+      ms = g_comm.allsum(ms) / (2.0 * nzg);
+      const double sc = ms > 0 ? P.init_amp / std::sqrt(ms) : 0.0;
+      for (size_t a = 0; a < size_t(nsp); ++a)
+        hs[a] += cplx(real(sc * ps[a].real()), real(sc * ps[a].imag()));
+    }
+    Sf[n].upload(hs);
   }
 
   // ---------------------------------------------------------------- diagnostics

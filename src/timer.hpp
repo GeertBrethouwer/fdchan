@@ -24,6 +24,7 @@ enum TimerId {
   tm_xfft, tm_zfft, tm_a2a, tm_halo,
   tm_log, tm_stats, tm_io,
   tm_p_rhs, tm_pack, tm_p_lu, tm_p_grad,  // parts of the pressure step
+  tm_snl, tm_ssolve,                      // scalars: explicit terms (part of tm_nl), update and implicit y-solve
   NTM
 };
 
@@ -145,6 +146,7 @@ struct Timer {
         {"time loop (total)", tm_loop},
         {"  RK steps", tm_rk},
         {"    nonlinear terms (incl. x-FFTs, halos)", tm_nl},
+        {"      of which scalars", tm_snl},
         {"    time-step limit (CFL, MPI_Allreduce)", tm_dt},
         {"    right-hand side (viscous terms, RK)", tm_rhs},
         {"    pressure", tm_p},
@@ -157,6 +159,7 @@ struct Timer {
         {"      gradient correction (halo, D1y phi)", tm_p_grad},
         {"      rest of the pressure", -3},
         {"    flow-rate correction (cfr)", tm_cfr},
+        {"    scalars (update, implicit y-solve)", tm_ssolve},
         {"    rest of the RK steps", -1},
         {"x-FFTs (all calls)", tm_xfft},
         {np == 1 ? "halo exchanges (local copies, all calls)"
@@ -175,13 +178,15 @@ struct Timer {
       std::fprintf(u, " wall-clock times in s; min/mean/max over the ranks; %% of the mean time-loop time\n%s", dash);
       std::fprintf(u, "%-44s%8s%11s%11s%11s%8s%11s\n", " part of the code", "calls", "min", "mean", "max", "%", "ms/step");
       for (const Row& r : rows) {
+        if ((r.id == tm_snl || r.id == tm_ssolve) && ncall[r.id] == 0) continue;  // no scalars
         if (r.id >= 0) {
           const double m = tsum[r.id] / np;
           std::fprintf(u, " %-43s%8ld%11.3f%11.3f%11.3f%8.1f%11.3f\n", r.name, ncall[r.id], tmin[r.id], m, tmax[r.id],
                        100 * m / tloop, 1000 * m / ns);
         } else {
           const double s =
-              r.id == -1 ? (tsum[tm_rk] - tsum[tm_nl] - tsum[tm_dt] - tsum[tm_rhs] - tsum[tm_p] - tsum[tm_cfr]) / np
+              r.id == -1 ? (tsum[tm_rk] - tsum[tm_nl] - tsum[tm_dt] - tsum[tm_rhs] - tsum[tm_p] - tsum[tm_cfr] -
+                              tsum[tm_ssolve]) / np
               : r.id == -3 ? (tsum[tm_p] - tsum[tm_p_rhs] - tsum[tm_pack] - tsum[tm_a2a] - tsum[tm_zfft] - tsum[tm_p_lu] -
                               tsum[tm_p_grad]) / np
                            : (tsum[tm_loop] - tsum[tm_rk] - tsum[tm_log] - tsum[tm_stats] - tsum[tm_io]) / np;

@@ -9,6 +9,8 @@
 
 namespace fd {
 
+constexpr int NSMAX = 8;  // maximum number of scalars
+
 struct Params {
   // grid
   int nx = 64, ny = 65, nz = 64;
@@ -51,6 +53,19 @@ struct Params {
   bool timing_sync = true;   // timers wait for the GPU (exact attribution, a little overhead)
   std::string comm_backend;  // nccl | mpi: halo exchanges and all-to-alls; default nccl if built with NCCL=1
   bool fuse_y = true;  // FDCHAN: y-derivatives formed inside the kernels that use them (one thread per line)
+  // scalars (as HiCHAN's &scalars and &buoyancy; per-scalar values are comma- or space-separated lists, entries
+  // not given keep the default)
+  int nscal = 0;
+  double pr[NSMAX], scal_theta[NSMAX], sval_bot[NSMAX], sval_top[NSMAX], ssrc_const[NSMAX], ssrc_u[NSMAX], ri[NSMAX];
+  std::string sbc_bot[NSMAX], sbc_top[NSMAX], sinit[NSMAX];
+  std::string scal_form = "advective";  // advective u.grad(s) | divergence div(u s) | skew (average of both)
+  double gravity[3] = {0, -1, 0};       // direction of gravity (normalised internally)
+  Params() {
+    for (int n = 0; n < NSMAX; ++n) {
+      pr[n] = 1; scal_theta[n] = 0.5; sval_bot[n] = 1; sval_top[n] = -1; ssrc_const[n] = 0; ssrc_u[n] = 0; ri[n] = 0;
+      sbc_bot[n] = "D"; sbc_top[n] = "D"; sinit[n] = "linear";
+    }
+  }
   // CPU only
   int nthreads = 0;
 
@@ -78,6 +93,34 @@ struct Params {
     auto L = [&](const char* k, long& v) { if (kv.count(k)) { v = std::stol(kv[k]); kv.erase(k); } };
     auto D = [&](const char* k, double& v) { if (kv.count(k)) { v = std::stod(kv[k]); kv.erase(k); } };
     auto S = [&](const char* k, std::string& v) { if (kv.count(k)) { v = kv[k]; kv.erase(k); } };
+    // lists: "a, b, c" or "a b c"; quotes around entries are removed
+    auto items = [&](const char* k) {
+      std::vector<std::string> out;
+      if (!kv.count(k)) return out;
+      std::string s = kv[k];
+      for (char& ch : s)
+        if (ch == ',') ch = ' ';
+      std::istringstream is(s);
+      std::string t;
+      while (is >> t) {
+        const char* q = "'\"";
+        t.erase(0, t.find_first_not_of(q));
+        t.erase(t.find_last_not_of(q) + 1);
+        out.push_back(t);
+      }
+      kv.erase(k);
+      return out;
+    };
+    auto DL = [&](const char* k, double* v, int nmax) {
+      std::vector<std::string> it = items(k);
+      if (int(it.size()) > nmax) fatal((std::string("too many values for ") + k).c_str());
+      for (size_t m = 0; m < it.size(); ++m) v[m] = std::stod(it[m]);
+    };
+    auto SL = [&](const char* k, std::string* v) {
+      std::vector<std::string> it = items(k);
+      if (int(it.size()) > NSMAX) fatal((std::string("too many values for ") + k).c_str());
+      for (size_t m = 0; m < it.size(); ++m) v[m] = it[m];
+    };
     auto B = [&](const char* k, bool& v) {
       if (kv.count(k)) {
         const std::string s = kv[k];
@@ -95,6 +138,11 @@ struct Params {
     S("data_dir", data_dir); I("iout_log", iout_log); I("iout_stats", iout_stats);
     I("iout_save_stats", iout_save_stats); I("iout_restart", iout_restart); D("tstats_start", tstats_start);
     I("mode_log_kx", mode_log_kx); I("mode_log_kz", mode_log_kz); B("timing", timing); B("timing_sync", timing_sync); B("fuse_y", fuse_y); S("comm_backend", comm_backend); I("nthreads", nthreads);
+    I("nscal", nscal);
+    DL("pr", pr, NSMAX); DL("scal_theta", scal_theta, NSMAX); DL("sval_bot", sval_bot, NSMAX); DL("sval_top", sval_top, NSMAX);
+    DL("ssrc_const", ssrc_const, NSMAX); DL("ssrc_u", ssrc_u, NSMAX); DL("ri", ri, NSMAX);
+    SL("sbc_bot", sbc_bot); SL("sbc_top", sbc_top); SL("sinit", sinit); S("scal_form", scal_form);
+    DL("gravity", gravity, 3);
     for (auto& p : kv) std::fprintf(stderr, "warning: unknown input item '%s'\n", p.first.c_str());
     if (nx % 2) fatal("nx must be even");
     if (fd_order % 2 || fd_order < 2 || fd_order > 8) fatal("fd_order must be 2, 4, 6 or 8");
@@ -107,6 +155,17 @@ struct Params {
     if (fd_order_z % 2 || fd_order_z < 2 || fd_order_z > 8) fatal("fd_order_z must be 2, 4, 6 or 8");
     if (z_scheme != "explicit" && z_scheme != "compact") fatal("z_scheme must be explicit or compact");
     if (z_scheme == "compact" && fd_order_z < 4) fatal("compact z_scheme: fd_order_z must be 4, 6 or 8");
+    if (nscal < 0 || nscal > NSMAX) fatal("nscal must be between 0 and 8");
+    if (scal_form != "advective" && scal_form != "divergence" && scal_form != "skew")
+      fatal("scal_form must be advective, divergence or skew");
+    for (int n = 0; n < nscal; ++n) {
+      if ((sbc_bot[n] != "D" && sbc_bot[n] != "N") || (sbc_top[n] != "D" && sbc_top[n] != "N"))
+        fatal("sbc_bot, sbc_top must be D (Dirichlet) or N (Neumann)");
+      if (scal_theta[n] < 0 || scal_theta[n] > 1) fatal("0 <= scal_theta <= 1 required");
+      if (sinit[n] != "linear" && sinit[n] != "zero" && sinit[n] != "noise") fatal("sinit must be linear, zero or noise");
+      if (pr[n] <= 0) fatal("pr must be > 0");
+    }
+    if (std::sqrt(gravity[0] * gravity[0] + gravity[1] * gravity[1] + gravity[2] * gravity[2]) == 0) fatal("gravity must not be zero");
   }
   void print() const {
     std::printf("grid      nx = %d, ny = %d, nz = %d, lx = %.6g, lz = %.6g, %s (alpha = %g), order %d (y) %d (z), dealias %d\n",
@@ -116,6 +175,13 @@ struct Params {
                 nstep, tmax, int(fixed_dt), dt, cfl, cfl_visc, rk_stages);
     std::printf("init      %s, amp = %g\n", init_type.c_str(), init_amp);
     if (timing) std::printf("timing    on%s (timing_report.txt, timing_steps.dat)\n", timing_sync ? ", GPU-synchronised" : "");
+    if (nscal > 0) {
+      std::printf("scalars   %d, %s form; gravity (%g, %g, %g)\n", nscal, scal_form.c_str(), gravity[0], gravity[1], gravity[2]);
+      for (int n = 0; n < nscal; ++n)
+        std::printf("  scalar %d: Pr = %g, theta = %.2f, bottom %s = %g, top %s = %g, Q_c = %g, Q_u = %g, Ri = %g, init %s\n",
+                    n + 1, pr[n], scal_theta[n], sbc_bot[n].c_str(), sval_bot[n], sbc_top[n].c_str(), sval_top[n],
+                    ssrc_const[n], ssrc_u[n], ri[n], sinit[n].c_str());
+    }
   }
 };
 

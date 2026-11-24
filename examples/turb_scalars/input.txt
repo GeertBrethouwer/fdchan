@@ -1,0 +1,41 @@
+! Coarse turbulent channel, Re_b = 2800 (as examples/turb_coarse) with two scalars, as HiCHAN's &scalars:
+!   1: temperature-like, Pr = 0.71, s = 1 / -1 at the walls, weakly stably stratified (Ri = 0.05, gravity -y)
+!   2: passive, Sc = 1, ds/dy = 0.5 at the bottom, s = 0 at the top, sources Q_c = 1 and Q_u u/ubulk with 0.5
+! log.dat gets dS1dy_b dS1dy_t dS2dy_b dS2dy_t, stats.dat S1 s1s1 us1 vs1 ws1 S2 s2s2 us2 vs2 ws2.
+nx = 32
+ny = 65
+nz = 48
+lx = 6.283185307179586
+lz = 3.141592653589793
+grid_type = tanh
+grid_alpha = 3.0
+fd_order = 6
+re = 2800
+forcing = cfr
+ubulk = 1.0
+cfl = 1.2
+dt_max = 0.05
+init_type = noise
+init_amp = 0.15
+tmax = 200
+nstep = 1000000
+iout_log = 200
+iout_stats = 20
+tstats_start = 120
+iout_save_stats = 2000
+iout_restart = 1000
+timing = 1
+y_scheme = compact
+nscal = 2
+pr = 0.71, 1.0
+scal_theta = 0.5, 0.5
+sbc_bot = D, N
+sbc_top = D, D
+sval_bot = 1, 0.5
+sval_top = -1, 0
+ssrc_const = 0, 1
+ssrc_u = 0, 0.5
+sinit = noise, zero
+scal_form = skew
+ri = 0.05, 0
+gravity = 0, -1, 0
