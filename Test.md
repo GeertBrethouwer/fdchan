@@ -78,11 +78,11 @@ python3 fit.py data/log.dat 250
 Expected:
 
 ```
-omega_i = -2.78324129e-03   abs. error = 3.40e-07   rel. error = 1.22e-04
+omega_i = -2.78324156e-03   abs. error = 3.41e-07   rel. error = 1.22e-04
 ```
 
 The same input with HiCHAN (ny = 65, `examples/ts_wave`) gives −2.78324103e-3: both codes use the same compact
-stencils and the advective form. The GPU result should agree with the CPU value to at least 8 digits. This case
+stencils and the advective form. The GPU result should agree with the CPU value to about 7 digits (log.dat has 7 significant digits, as HiCHAN's). This case
 is tiny (4 × 65 × 1), so the run time is set by kernel launches (175 000 steps), not by the GPU's speed; it says
 nothing about performance. On the laptop CPU it took 375 s.
 
@@ -103,7 +103,7 @@ done
 diff turb_gpu/data/log.dat turb_cpu/data/log.dat
 ```
 
-Expected: the two `log.dat` files agree to about 10 or more of the printed digits after 30 steps; only the `max|div|`
+Expected: the two `log.dat` files agree in (nearly) all of the 7 printed digits after 30 steps; only the `div_max`
 column (round-off itself, about 1e-15) differs completely. cuFFT and the CPU FFT round differently, so bitwise
 agreement is not expected, and differences grow slowly in time (the flow is chaotic).
 
@@ -123,8 +123,8 @@ Expected:
 
 - stdout: `FDCHAN (GPU build, N rank(s), double precision)` and
   `parallel  N rank(s), z-slabs of ... planes, ... x-modes per rank in the pressure solve`;
-- the `log.dat` files of r1, r2 and r4 agree to all printed digits except `max|div|` (on the CPU, 1–4 ranks agreed
-  to all 11 digits; only the order of the global sums differs, at the 1e-15 level);
+- the `log.dat` files of r1, r2 and r4 agree to all printed digits except `div_max` (on the CPU, 1–4 ranks agreed
+  to all digits of the earlier 11-digit log format; only the order of the global sums differs, at the 1e-15 level);
 - r1 agrees with `fdchan_gpu` of 2.3 to all printed digits (`fdchan_gpu` and `fdchan_gpu_mpi` on one rank do the same
   arithmetic).
 

@@ -3,6 +3,8 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <fstream>
 
 #include "solver.hpp"
@@ -151,50 +153,78 @@ int main(int argc, char** argv) {
   } else {
     S.init_flow();
   }
+  // log.dat and stats.dat in the format of HiCHAN (columns, headers, number formats)
   std::FILE* lg = nullptr;
   if (root) {
     lg = std::fopen((P.data_dir + "/log.dat").c_str(), P.init_type == "restart" ? "a" : "w");
     if (!lg) fatal("cannot open log.dat");
-    std::fprintf(lg, "# step t dt ubulk -dpdx tau_w(bottom) tau_w(top) re_tau max|div| E_fluct E_v(mode_log_kx)\n");
+    std::fprintf(lg, "#    step          time            dt         ubulk  dpdx_applied         tau_w        Re_tau"
+                     "     div_max          Ekin        E_mode\n");
   }
   auto log_line = [&]() {
     Solver::Log L = S.diagnostics();  // collective
     if (!root) return;
-    std::fprintf(lg, "%8ld %.10e %.6e %.10e %.10e %.10e %.10e %.6e %.3e %.10e %.10e\n", S.step, S.time, S.dt, L.ub,
-                 S.dpdx_step, L.tau_b, L.tau_t, L.retau, L.div, L.ef, L.emode);
+    // HiCHAN: (i9, 6es14.6, es11.3, 2es14.6)
+    std::fprintf(lg, "%9ld%14.6E%14.6E%14.6E%14.6E%14.6E%14.6E%11.3E%14.6E%14.6E\n", S.step, S.time, S.dt, L.ub,
+                 S.dpdx_step, L.tau_w, L.retau, L.div, L.ef, L.emode);
     std::fflush(lg);
     std::printf("step %8ld  t = %.5f  dt = %.3e  Ub = %.6f  -dp/dx = %.6e  Re_tau = %.2f  div = %.1e  E' = %.4e\n",
                 S.step, S.time, S.dt, L.ub, S.dpdx_step, L.retau, L.div, L.ef);
     std::fflush(stdout);
   };
   log_line();
-  // statistics: U V W and <u'u'> <v'v'> <w'w'> <u'v'>
-  std::vector<double> st(size_t(8 * S.ny), 0.0);
+  // statistics, as HiCHAN: time-weighted averages (weight dt * iout_stats) of U V W, <u'u'> <v'v'> <w'w'> <u'v'>
+  // <u'w'> <v'w'>, P and <p'p'> (P: the pressure of the last RK stage; with nl_form = rotational the total
+  // pressure p + |u|^2/2). Sampled right after the step, before the log line reuses the array that holds phi.
+  const int NQ = 11;
+  static const char* qname[NQ] = {"U", "V", "W", "uu", "vv", "ww", "uv", "uw", "vw", "P", "pp"};
+  std::vector<double> st(size_t(NQ) * S.ny, 0.0);
+  double tsum = 0;
   long nsamp = 0;
   auto sample = [&]() {
+    const double wgt = S.dt * P.iout_stats;
     std::vector<double> m[3] = {S.mean_profile(0), S.mean_profile(1), S.mean_profile(2)};
-    std::vector<double> uu = S.profile(0, 0, false), vv = S.profile(1, 1, false), ww = S.profile(2, 2, false),
-                        uv = S.profile(0, 1, true);
+    std::vector<double> c[6] = {S.profile(0, 0, false), S.profile(1, 1, false), S.profile(2, 2, false),
+                                S.profile(0, 1, true),  S.profile(0, 2, true),  S.profile(1, 2, true)};
+    const int ca[6] = {0, 1, 2, 0, 0, 1}, cb[6] = {0, 1, 2, 1, 2, 2};
+    const cplx* phi = S.T1.p;  // phi of the last stage (see Solver::pscale)
+    std::vector<double> pm = S.mean_of(phi), pp = S.profile_of(phi, phi);
+    const double ps = S.pscale;
     for (int j = 0; j < S.ny; ++j) {
-      const size_t o = size_t(8 * j);
-      st[o + 0] += m[0][size_t(j)];
-      st[o + 1] += m[1][size_t(j)];
-      st[o + 2] += m[2][size_t(j)];
-      st[o + 3] += uu[size_t(j)] - m[0][size_t(j)] * m[0][size_t(j)];
-      st[o + 4] += vv[size_t(j)] - m[1][size_t(j)] * m[1][size_t(j)];
-      st[o + 5] += ww[size_t(j)] - m[2][size_t(j)] * m[2][size_t(j)];
-      st[o + 6] += uv[size_t(j)] - m[0][size_t(j)] * m[1][size_t(j)];
+      const size_t jj = size_t(j), o = size_t(NQ) * jj;
+      for (int q = 0; q < 3; ++q) st[o + size_t(q)] += wgt * m[q][jj];
+      for (int q = 0; q < 6; ++q) st[o + 3 + size_t(q)] += wgt * (c[q][jj] - m[ca[q]][jj] * m[cb[q]][jj]);
+      st[o + 9] += wgt * ps * pm[jj];
+      st[o + 10] += wgt * ps * ps * (pp[jj] - pm[jj] * pm[jj]);
     }
+    tsum += wgt;
     ++nsamp;
+  };
+  // Fortran ESw.dEe (e.g. HiCHAN's es16.7e3): d decimals, e exponent digits, right-aligned in w
+  auto fes = [](double v, int w, int d, int e) {
+    char m[64], out[96];
+    std::snprintf(m, sizeof(m), "%.*E", d, v);
+    char* ep = std::strchr(m, 'E');
+    const int ex = std::atoi(ep + 1);
+    *ep = '\0';
+    std::snprintf(out, sizeof(out), "%sE%c%0*d", m, ex < 0 ? '-' : '+', e, ex < 0 ? -ex : ex);
+    std::string r(out);
+    if (int(r.size()) < w) r.insert(0, size_t(w) - r.size(), ' ');
+    return r;
   };
   auto save_stats = [&]() {
     if (nsamp == 0 || !root) return;
     std::FILE* f = std::fopen((P.data_dir + "/stats.dat").c_str(), "w");
-    std::fprintf(f, "# %ld samples, t = %.6f\n# y U V W <u'u'> <v'v'> <w'w'> <u'v'>\n", nsamp, S.time);
+    std::fprintf(f, "# time-averaged profiles; t_end = %14.6E, averaging time = %14.6E, samples = %ld\n", S.time, tsum,
+                 nsamp);
+    std::fprintf(f, "# fluctuation moments are <f'g'>; P and pp are the (total, if nl_form=rotational) pressure\n");
+    std::fprintf(f, "#            y");
+    for (int q = 0; q < NQ; ++q) std::fprintf(f, "%16s", qname[q]);
+    std::fprintf(f, " \n");
     for (int j = 0; j < S.ny; ++j) {
-      std::fprintf(f, "%.10e", S.y[size_t(j)]);
-      for (int c = 0; c < 7; ++c) std::fprintf(f, " %.10e", st[size_t(8 * j + c)] / nsamp);
-      std::fprintf(f, "\n");
+      std::string line = fes(S.y[size_t(j)], 16, 7, 3);
+      for (int q = 0; q < NQ; ++q) line += fes(st[size_t(NQ) * size_t(j) + size_t(q)] / tsum, 16, 7, 3);
+      std::fprintf(f, "%s\n", line.c_str());
     }
     std::fclose(f);
   };
@@ -210,15 +240,16 @@ int main(int argc, char** argv) {
     g_timer.tic(tm_rk);
     S.advance();
     g_timer.toc(tm_rk);
+    // statistics first: they need phi of the last stage, which the log line overwrites
+    g_timer.tic(tm_stats);
+    if (P.iout_stats > 0 && S.step % P.iout_stats == 0 && S.time >= P.tstats_start) sample();
+    if (P.iout_save_stats > 0 && S.step % P.iout_save_stats == 0) save_stats();
+    g_timer.toc(tm_stats);
     if (P.iout_log > 0 && S.step % P.iout_log == 0) {
       g_timer.tic(tm_log);
       log_line();
       g_timer.toc(tm_log);
     }
-    g_timer.tic(tm_stats);
-    if (P.iout_stats > 0 && S.step % P.iout_stats == 0 && S.time >= P.tstats_start) sample();
-    if (P.iout_save_stats > 0 && S.step % P.iout_save_stats == 0) save_stats();
-    g_timer.toc(tm_stats);
     if (P.iout_restart > 0 && S.step % P.iout_restart == 0) {
       g_timer.tic(tm_io);
       write_restart(S, P.data_dir + "/restart.bin");

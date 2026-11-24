@@ -255,6 +255,7 @@ class Solver {
   ZFFT zfft;
   // state
   double time = 0, dt = 0, dpdx_step = 0;
+  double pscale = 0;  // p = pscale * phi of the last stage (in T1 after advance(), until T1 is reused)
   long step = 0;
   int W1 = 0, W2 = 0;
 
@@ -741,6 +742,8 @@ class Solver {
         g_timer.toc(tm_cfr);
       }
     }
+    // u = r - grad phi with r = u + dt (gam H + zet H_old): phi = (gam + zet) dt p for the last stage
+    pscale = 1.0 / ((gam[ns - 1] + zet[ns - 1]) * dt);
     if (P.forcing == "cfr") dpdx_step = dpdx_acc / dt;
     else dpdx_step = P.dpdx;
     time += dt;
@@ -1340,25 +1343,30 @@ class Solver {
   // ---------------------------------------------------------------- diagnostics
   // per-y sums over (z, kx) with the Parseval weights (kx > 0 counted twice), divided by nz
   std::vector<double> profile(int a, int b, bool cross) {
-    const int nkx_ = nkx, nz_ = nz;
     const cplx* F[3] = {u.p, v.p, w.p};
-    const cplx *fa = F[a], *fb = F[b];
+    (void)cross;
+    return profile_of(F[a], F[b]);
+  }
+  // <f g> over (x, z) per y, for any two spectral arrays (layout of u)
+  std::vector<double> profile_of(const cplx* fa, const cplx* fb) {
+    const int nkx_ = nkx, nz_ = nz;
     rowsum(ny, nz_ * nkx_, [=] HD(int j, int c) {
       const int i = c % nkx_;
       const idx n = idx(j) * nz_ * nkx_ + c;
       const double wgt = (i == 0) ? 1.0 : 2.0;
       return wgt * double(fa[n].re * fb[n].re + fa[n].im * fb[n].im);
     }, d_prof.p);
-    (void)cross;
     std::vector<double> p = fetch(d_prof.p, ny);
     g_comm.allsum(p);
     for (double& x : p) x /= nzg;
     return p;
   }
   std::vector<double> mean_profile(int c) {
-    const int nkx_ = nkx, nz_ = nz;
     const cplx* F[3] = {u.p, v.p, w.p};
-    const cplx* f = F[c];
+    return mean_of(F[c]);
+  }
+  std::vector<double> mean_of(const cplx* f) {
+    const int nkx_ = nkx, nz_ = nz;
     rowsum(ny, nz_, [=] HD(int j, int k) { return double(f[(idx(j) * nz_ + k) * nkx_].re); }, d_prof.p);
     std::vector<double> p = fetch(d_prof.p, ny);
     g_comm.allsum(p);
@@ -1370,15 +1378,38 @@ class Solver {
     for (int j = 0; j < ny; ++j) s += q[size_t(j)] * f[size_t(j)];
     return s;
   }
-  double mode_energy_v(int i) {
-    if (i < 0 || i >= nkx) return 0;
-    const int nkx_ = nkx, nz_ = nz;
-    const cplx* f = v.p;
-    rowsum(ny, nz_, [=] HD(int j, int k) { return double(abs2(f[(idx(j) * nz_ + k) * nkx_ + i])); }, d_prof.p);
-    std::vector<double> p = fetch(d_prof.p, ny);
-    g_comm.allsum(p);
-    for (double& x : p) x /= nzg;
-    return 0.5 * integrate(p);
+  // energy of one Fourier mode as in HiCHAN: integral over y of |u|^2 + |v|^2 + |w|^2 of its coefficient
+  // f(kx, kz, y) = (1/nz) sum_z f(kx, z, y) exp(-i kz z); kx >= 0, kz may be negative; -1 (kx < 0): not logged (0)
+  double mode_energy(int ikx, int ikz) {
+    if (ikx < 0 || ikx >= nkx) return 0;
+    const int nkx_ = nkx, nz_ = nz, z0_ = z0, nzg_ = nzg;
+    const double kz2pi = 2 * M_PI * double(ikz) / nzg_;
+    std::vector<double> cre[3], cim[3];
+    const cplx* F[3] = {u.p, v.p, w.p};
+    for (int c = 0; c < 3; ++c) {
+      const cplx* f = F[c];
+      rowsum(ny, nz_, [=] HD(int j, int k) {
+        const cplx a = f[(idx(j) * nz_ + k) * nkx_ + ikx];
+        const double ph = kz2pi * double(z0_ + k), cs = cos(ph), sn = sin(ph);
+        return double(a.re) * cs + double(a.im) * sn;  // Re(a exp(-i ph))
+      }, d_prof.p);
+      cre[c] = fetch(d_prof.p, ny);
+      rowsum(ny, nz_, [=] HD(int j, int k) {
+        const cplx a = f[(idx(j) * nz_ + k) * nkx_ + ikx];
+        const double ph = kz2pi * double(z0_ + k), cs = cos(ph), sn = sin(ph);
+        return double(a.im) * cs - double(a.re) * sn;  // Im(a exp(-i ph))
+      }, d_prof.p);
+      cim[c] = fetch(d_prof.p, ny);
+      g_comm.allsum(cre[c]);
+      g_comm.allsum(cim[c]);
+    }
+    std::vector<double> e(static_cast<size_t>(ny), 0.0);
+    for (int c = 0; c < 3; ++c)
+      for (int j = 0; j < ny; ++j) {
+        const double re = cre[c][size_t(j)] / nzg_, im = cim[c][size_t(j)] / nzg_;
+        e[size_t(j)] += re * re + im * im;
+      }
+    return integrate(e);
   }
   double max_divergence() {
     const int nkx_ = nkx, nz_ = nz, ny_ = ny;
@@ -1405,7 +1436,7 @@ class Solver {
     }));
   }
   struct Log {
-    double ub, tau_b, tau_t, retau, div, ef, emode;
+    double ub, tau_b, tau_t, tau_w, retau, div, ef, emode;
   };
   Log diagnostics() {
     Log L;
@@ -1415,11 +1446,11 @@ class Solver {
     const double g0 = dU[0], g1 = dU[size_t(ny - 1)];
     L.tau_b = nu * g0;
     L.tau_t = -nu * g1;
-    L.retau = std::sqrt(std::max(0.0, 0.5 * (L.tau_b + L.tau_t))) * P.re;
+    L.tau_w = 0.5 * (std::abs(L.tau_b) + std::abs(L.tau_t));  // as HiCHAN: mean of both walls
+    L.retau = std::sqrt(L.tau_w) * P.re;
     double e = 0;
     for (int c = 0; c < 3; ++c) e += integrate(profile(c, c, false));
     double em = 0;
-    for (double x : U) (void)x;
     {
       std::vector<double> U2(U.size());
       for (size_t j = 0; j < U.size(); ++j) U2[j] = U[j] * U[j];
@@ -1427,7 +1458,7 @@ class Solver {
     }
     L.ef = 0.25 * (e - em);  // (1/2) <u'.u'> averaged over the channel height 2
     L.div = max_divergence();
-    L.emode = mode_energy_v(P.mode_log_kx);
+    L.emode = mode_energy(P.mode_log_kx, P.mode_log_kz);
     return L;
   }
 };

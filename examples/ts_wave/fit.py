@@ -4,7 +4,7 @@ import sys, math
 t=[];e=[]
 for l in open(sys.argv[1]):
     if l.startswith('#'): continue
-    s=l.split(); t.append(float(s[1])); e.append(float(s[10]))
+    s=l.split(); t.append(float(s[1])); e.append(float(s[9]))  # E_mode (energy of mode mode_log_kx, mode_log_kz)
 t0=float(sys.argv[2]) if len(sys.argv)>2 else 200
 pts=[(a,math.log(b)) for a,b in zip(t,e) if a>=t0]
 n=len(pts); sx=sum(p[0] for p in pts); sy=sum(p[1] for p in pts); sxx=sum(p[0]**2 for p in pts); sxy=sum(p[0]*p[1] for p in pts)

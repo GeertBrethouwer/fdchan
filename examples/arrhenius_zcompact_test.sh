@@ -67,14 +67,14 @@ for n in 1 2; do
   grep -h "z compact\|fdchan error" solver_${n}gpu.log | head -2 | sed 's/^/             /'
 done
 if [ -f solver_1gpu/data/log.dat ] && [ -f solver_2gpu/data/log.dat ]; then
-  # all columns except 9 (max|div|)
-  if cmp -s <(awk '{$9=""; print}' solver_1gpu/data/log.dat) <(awk '{$9=""; print}' solver_2gpu/data/log.dat); then
+  # all columns except 8 (div_max)
+  if cmp -s <(awk '{$8=""; print}' solver_1gpu/data/log.dat) <(awk '{$8=""; print}' solver_2gpu/data/log.dat); then
     echo "solver 1 vs 2 GPUs: log.dat agrees in all printed digits except max|div|"
   else
     echo "solver 1 vs 2 GPUs: log.dat DIFFERS (last lines):"
     tail -1 solver_1gpu/data/log.dat; tail -1 solver_2gpu/data/log.dat
   fi
   for n in 1 2; do
-    awk -v n=$n 'NR>1 && $9>m{m=$9} END{print "solver_" n "gpu max|div| over the run: " m}' solver_${n}gpu/data/log.dat
+    awk -v n=$n 'NR>1 && $8>m{m=$8} END{print "solver_" n "gpu max|div| over the run: " m}' solver_${n}gpu/data/log.dat
   done
 fi

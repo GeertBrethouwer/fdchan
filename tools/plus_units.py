@@ -45,4 +45,4 @@ if len(sys.argv) > 4:
     t0 = float(sys.argv[4])
     d = [list(map(float, l.split())) for l in open(sys.argv[3]) if not l.startswith('#')]
     d = [r for r in d if r[1] >= t0]
-    print('Re_tau from log.dat, t >= %g: %.1f (%d samples)' % (t0, sum(r[7] for r in d) / len(d), len(d)))
+    print('Re_tau from log.dat, t >= %g: %.1f (%d samples)' % (t0, sum(r[6] for r in d) / len(d), len(d)))

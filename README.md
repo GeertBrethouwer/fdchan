@@ -94,7 +94,7 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `restart_file`, `reset_time` | restart.bin, false | for `init_type = restart` |
 | `data_dir` | data | output directory |
 | `iout_log`, `iout_stats`, `iout_save_stats`, `iout_restart`, `tstats_start` | 100, 0, 0, 0, 0 | output intervals in steps |
-| `mode_log_kx` | 1 | kx index of the mode whose v-energy is logged |
+| `mode_log_kx`, `mode_log_kz` | −1, 0 | Fourier mode (kx index ≥ 0, kz index of either sign) whose energy is logged as `E_mode` (as HiCHAN; kx < 0: none) |
 | `timing`, `timing_sync` | false, true | timers as in HiCHAN: `timing_report.txt` and `timing_steps.dat` (see Output). `timing_sync` makes every timer wait for the GPU (exact attribution of the time to the parts) |
 | `comm_backend` | nccl (NCCL=1 builds), else mpi | `nccl` or `mpi` for the halo exchanges and all-to-alls; `mpi` needs a CUDA-aware MPI |
 | `fuse_y` | true | form the y-derivatives inside the kernels that use them (one thread per y-line, no derivative arrays written and read back; as x3d2's fused transport kernels). `false`: separate derivative and pointwise kernels. Same results to the last bit |
@@ -107,9 +107,18 @@ the peaks of the rms and shear-stress profiles in wall units.
 
 ## Output
 
-* `log.dat`: step, t, Δt, bulk velocity, −dp/dx, τ_w (bottom, top), Re_τ, max |div u| (all points, walls
-  included), fluctuation energy, v-energy of mode `mode_log_kx`.
-* `stats.dat`: time averages of U, V, W, ⟨u′u′⟩, ⟨v′v′⟩, ⟨w′w′⟩, ⟨u′v′⟩ (Parseval in x, averages over z).
+`log.dat` and `stats.dat` have the same columns, headers and number formats as HiCHAN's (without the scalar
+columns, as FDCHAN has no scalars yet), so the same tools read both.
+
+* `log.dat`: `step time dt ubulk dpdx_applied tau_w Re_tau div_max Ekin E_mode`: τ_w the mean of both walls,
+  Re_τ = √τ_w/ν, div_max = max |div u| over all points (walls included), Ekin = ½ ⟨u′·u′⟩ averaged over the
+  channel, E_mode = ∫ (|û|² + |v̂|² + |ŵ|²) dy of the Fourier mode (`mode_log_kx`, `mode_log_kz`). Format
+  `(i9, 6es14.6, es11.3, 2es14.6)`.
+* `stats.dat`: time-weighted averages (weight Δt × `iout_stats`) of `U V W uu vv ww uv uw vw P pp` against y:
+  the means, the moments ⟨f′g′⟩ (Parseval in x, averages over z), and the pressure of the last RK stage. As in
+  HiCHAN the mean (kx = kz = 0) mode of the pressure is not computed, so P is 0 and pp is the variance of its
+  fluctuations; with `nl_form = rotational` it is the total pressure p + |u|²/2. Format `es16.7e3`, three
+  header lines.
 * `restart.bin`: the spectral fields (kx, z, y) and the time; written at the end and every `iout_restart` steps.
 * With `timing = 1` (as HiCHAN's `timing = .true.`):
   * `timing_report.txt` (also printed at the end of the run): the wall-clock time spent in each part of the
