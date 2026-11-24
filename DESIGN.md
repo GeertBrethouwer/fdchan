@@ -105,12 +105,16 @@ dropping terms of order rⁿ, r = (1 − √(1 − 4α²)) / (2α) (0.38 for 6th
 round-off for n ≥ 40 (6th) or 49 (8th) planes per rank in double precision, checked at start-up; one rank solves
 the periodic 2×2 system exactly. The communication is one plane each way per derivative, no collectives.
 
-Cost: each z-derivative is now two passes over the lines (right-hand side + Thomas sweep, then the correction)
-instead of an inline stencil, and the kernels read the derivative from a work array (`DZ1`, `DZ2`: two extra
-fields). Per RK stage there are 4 first and 3 second z-derivatives (∂v/∂z and ∂u/∂z for the vorticity, ∂R_z/∂z
-and ∂φ/∂z in the pressure step, D2z of u, v, w). *Estimate:* about 5–10 % more time per step than explicit z,
-against 30–40 % fewer points. Not yet fused into the kernels that use the derivatives (as x3d2's transeq kernels
-do); that is the next step if the measurements show the derivative passes to matter.
+Cost: each compact z-derivative is one pass over the lines (right-hand side and Thomas sweep: the block solution
+y is written and read back once), one exchange of a plane with each neighbour, and a small kernel that computes
+x₋₁ and xₙ per line. The second phase is fused into the kernels that use the derivative: they read it through a
+`ZDer` view that forms x_k = y_k + p_k x₋₁ + q_k xₙ as it reads (same operations, same order as writing x out
+first), so x is never written in final form. Per RK stage there are 4 first and 3 second z-derivatives (∂v/∂z and
+∂u/∂z for the vorticity, ∂R_z/∂z and ∂φ/∂z in the pressure step, D2z of u, v, w). Measured on 4 GH200 (double
+precision, 2048 × 321 × 1536, compact 8th against explicit 8th order, before this fusion): +8 % per time step
+(+42 ms in the viscous terms, +18 ms in the gradient correction, nothing extra in the nonlinear terms). The fusion
+removes two of the seven passes over the field per derivative (expected: about a third of that cost). The first
+phase cannot be fused: the Thomas sweep must reach the end of the line before any value is final.
 
 ## 2. Spatial discretisation
 

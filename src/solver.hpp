@@ -65,6 +65,22 @@ struct ZCmp {
   real e11, e12, e21, e22;            // one rank: inverse of the exact periodic 2x2 system
 };
 
+// A compact z-derivative as its kernels read it (fused second phase): the block solution y and, per line, the
+// values x_{-1} and x_n of the neighbouring blocks; x_k = y_k + p_k x_{-1} + q_k x_n is formed where it is read,
+// so the derivative is never written in final form (one pass less over the field to write, one to read).
+struct ZDer {
+  const cplx* y = nullptr;   // block solution, layout (j*nz + k)*nkx + i
+  const cplx* xb = nullptr;  // x_{-1} at [ln], x_n at [nlines + ln], ln = j*nkx + i
+  const real *pv = nullptr, *qv = nullptr;
+  int nz = 0, nkx = 0;
+  idx nlines = 0;
+  HD bool valid() const { return y != nullptr; }
+  HD cplx at(int j, int k, int i) const {
+    const idx ln = idx(j) * nkx + i;
+    return y[(idx(j) * nz + k) * nkx + i] + pv[k] * xb[ln] + qv[k] * xb[nlines + ln];
+  }
+};
+
 // coefficients of the tridiagonal compact scheme of the given order for the d-th derivative (d = 1, 2) on a uniform
 // grid, from the Taylor conditions: unknowns al, c_1..c_L with L = order/2 - 1
 inline void compact_coeffs(int d, int order, double& al, std::vector<double>& c) {
@@ -138,7 +154,7 @@ HD inline cplx zv(const cplx* f, const cplx* hal, idx L, int i, int kk, int j, i
 // pointwise part of rhs(): H = N + nu Lap f, r = f + dtg H + dtz H_old at spectral point n (padded point o)
 struct RhsPoint {
   const cplx *f, *hf;
-  const cplx* d2z = nullptr;  // compact z: D2z f (line length nkx); explicit: nullptr, the stencil of z is used
+  ZDer d2z;  // compact z: D2z f; explicit: not valid, the stencil of z is used
   cplx *h, *r;
   const real* kx;
   ZSt z;
@@ -152,7 +168,7 @@ struct RhsPoint {
     }
     const cplx fc = f[n];
     cplx lap = (-kx[i] * kx[i]) * fc + d2y;
-    if (d2z) lap += d2z[n];
+    if (d2z.valid()) lap += d2z.at(j, k, i);
     else
       for (int l = -z.h; l <= z.h; ++l) lap += z.a2[l + z.h] * zv(f, hf, nkx, i, k + l, j, nz, z.h, ny, nkx);
     cplx hh = sc * r[o] + nuu * lap;
@@ -165,15 +181,15 @@ struct RhsPoint {
 // pointwise part of nonlinear(): u, v, w and the vorticity into the padded arrays C0..C5 at padded point n
 struct VortPoint {
   const cplx *U, *V, *W, *hU, *hV;
-  const cplx *dzU = nullptr, *dzV = nullptr;  // compact z: D1z u, D1z v (line length nkx)
+  ZDer dzU, dzV;  // compact z: D1z u, D1z v
   cplx *C0, *C1, *C2, *C3, *C4, *C5;
   const real* kx;
   ZSt z;
   int nkx, nz, ny;
   HD void operator()(idx n, idx s, int i, int k, int j, cplx dyu, cplx dyw) const {
     cplx dzu(0, 0), dzv(0, 0);
-    if (dzU) {
-      dzu = dzU[s]; dzv = dzV[s];
+    if (dzU.valid()) {
+      dzu = dzU.at(j, k, i); dzv = dzV.at(j, k, i);
     } else {
       for (int l = -z.h; l <= z.h; ++l) {
         if (l == 0) continue;
@@ -211,7 +227,8 @@ class Solver {
   double zc_al[2] = {0, 0}, zc_r[2] = {0, 0};
   int zc_nmin = 0;
   DArray<real> d_zcp[2], d_zinv[2], d_zpv[2], d_zqv[2];
-  DArray<cplx> DZ1, DZ2, d_zx;  // compact z: derivative work arrays; first/last values of the lines for the exchange
+  DArray<cplx> DZ1, DZ2, d_zx;  // compact z: block solutions y; first/last values of the lines for the exchange
+  DArray<cplx> ZB1, ZB2;        // compact z: x_{-1}, x_n per line of DZ1, DZ2
   // device arrays
   struct YDev {  // a y derivative on the device
     const int* s;
@@ -286,6 +303,7 @@ class Solver {
     if (zcomp) {
       DZ1.alloc(nsp); DZ2.alloc(nsp);
       d_zx.alloc(4 * idx(ny) * nkx);
+      ZB1.alloc(2 * idx(ny) * nkx); ZB2.alloc(2 * idx(ny) * nkx);
     }
     d_prof.alloc(4 * idx(ny));
     d_scal.alloc(8);
@@ -380,9 +398,11 @@ class Solver {
     for (int t = 0; t <= 2000; ++t) kap1 = std::max(kap1, k1(M_PI * t / 2000));
   }
 
-  // d-th z-derivative (0: D1z, 1: D2z) of f (line length L, halos in hal) into out (line length nkx), modes i < nkx,
-  // all y; z_scheme = compact only. Two passes over the lines and one exchange of a plane with each neighbour.
-  void zderiv(int d, const cplx* f, idx L, const cplx* hal, cplx* out) {
+  // d-th z-derivative (0: D1z, 1: D2z) of f (line length L, halos in hal), modes i < nkx, all y; z_scheme = compact
+  // only. One pass over the lines (right-hand side, Thomas sweep: the block solution y in out), one exchange of a
+  // plane with each neighbour, and per line x_{-1}, x_n in xb (2*ny*nkx). The kernels read the derivative through
+  // the returned ZDer, which forms x = y + p x_{-1} + q x_n as it is read (no pass to write x).
+  ZDer zderiv(int d, const cplx* f, idx L, const cplx* hal, cplx* out, cplx* xb) {
     const ZCmp Z = zc[d];
     const int nz_ = nz, ny_ = ny, nkx_ = nkx, h = hz_halo;
     const idx nlines = idx(ny_) * nkx_, lstride = nkx_;
@@ -422,9 +442,8 @@ class Solver {
       g_comm.sendrecv(reinterpret_cast<const real*>(sfirst), 2 * nlines, dn, reinterpret_cast<real*>(rnext), up, 22);
       g_timer.toc(tm_halo);
     }
-    // 3: x_{-1}, x_n from the 2x2 systems at the block boundaries, x = y + x_{-1} p + x_n q
-    pfor_lines(nlines, [=] HD(idx ln) {
-      const int i = int(ln % nkx_), j = int(ln / nkx_);
+    // 3: x_{-1}, x_n from the 2x2 systems at the block boundaries (x = y + x_{-1} p + x_n q where it is read)
+    pfor(nlines, [=] HD(idx ln) {
       cplx xm1, xn;
       if (single) {
         const cplx yl = slast[ln], yf = sfirst[ln];
@@ -436,8 +455,21 @@ class Solver {
         xm1 = ylp + Z.qn1p * x0;                     // last value of the previous block
         xn = Z.ir * (yfn + Z.p0n * yl);              // first value of the next block
       }
-      cplx* o = out + idx(j) * nz_ * lstride + i;
-      for (int k = 0; k < nz_; ++k) o[idx(k) * lstride] = o[idx(k) * lstride] + Z.pv[k] * xm1 + Z.qv[k] * xn;
+      xb[ln] = xm1;
+      xb[nlines + ln] = xn;
+    });
+    ZDer r;
+    r.y = out; r.xb = xb; r.pv = Z.pv; r.qv = Z.qv; r.nz = nz_; r.nkx = nkx_; r.nlines = nlines;
+    return r;
+  }
+  // the same, written out in final form into out (tests)
+  void zderiv_full(int d, const cplx* f, idx L, const cplx* hal, cplx* out, cplx* xb) {
+    const ZDer r = zderiv(d, f, L, hal, out, xb);
+    pfor(nsp, [=] HD(idx n) {
+      const int i = int(n % r.nkx);
+      const idx kj = n / r.nkx;
+      const int k = int(kj % r.nz), j = int(kj / r.nz);
+      out[n] = r.at(j, k, i);
     });
   }
 
@@ -781,9 +813,8 @@ class Solver {
     pt.C4 = reinterpret_cast<cplx*>(Pb[4].p); pt.C5 = reinterpret_cast<cplx*>(Pb[5].p);
     pt.kx = d_kx.p; pt.z = zs; pt.nkx = nkx_; pt.nz = nz_; pt.ny = ny_;
     if (zcomp) {  // compact z: D1z u and D1z v first
-      zderiv(0, u.p, nkx, hbA.p, DZ1.p);
-      zderiv(0, v.p, nkx, hbB.p, DZ2.p);
-      pt.dzU = DZ1.p; pt.dzV = DZ2.p;
+      pt.dzU = zderiv(0, u.p, nkx, hbA.p, DZ1.p, ZB1.p);
+      pt.dzV = zderiv(0, v.p, nkx, hbB.p, DZ2.p, ZB2.p);
     }
     const idx nl = idx(nz_) * nkx_;
     if (P.fuse_y) {
@@ -859,8 +890,8 @@ class Solver {
       const cplx* hf = HB[comp];
       ydiff(0, f, T1.p);
       const cplx* dyf = T1.p;
-      if (zcomp) zderiv(0, f, nkx_, hf, DZ1.p);
-      const cplx* dzf = zcomp ? DZ1.p : nullptr;
+      ZDer dzf;
+      if (zcomp) dzf = zderiv(0, f, nkx_, hf, DZ1.p, ZB1.p);
       cplx *G0 = reinterpret_cast<cplx*>(Pb[6].p), *G1 = reinterpret_cast<cplx*>(Pb[7].p),
            *G2 = reinterpret_cast<cplx*>(Pb[8].p);
       pfor(idx(lp_) * nz_ * ny_, [=] HD(idx n) {
@@ -870,7 +901,7 @@ class Solver {
           const int k = int(kj % nz_), j = int(kj / nz_);
           const idx s = kj * nkx_ + i;
           cplx dz(0, 0);
-          if (dzf) dz = dzf[s];
+          if (dzf.valid()) dz = dzf.at(j, k, i);
           else
             for (int l = -z.h; l <= z.h; ++l) {
               if (l == 0) continue;
@@ -940,8 +971,7 @@ class Solver {
       pt.nkx = nkx_; pt.nz = nz_; pt.ny = ny_;
       pt.sc = sc; pt.nuu = nuu; pt.dtg = dtg; pt.dtz = dtz; pt.force = force;
       if (zcomp) {  // compact z: D2z f first
-        zderiv(1, f, nkx_, hf, DZ1.p);
-        pt.d2z = DZ1.p;
+        pt.d2z = zderiv(1, f, nkx_, hf, DZ1.p, ZB1.p);
       }
       if (P.fuse_y) {
         // D2y f is formed in the y-sweep and used at once (x3d2's fused transport kernels): one thread per
@@ -979,8 +1009,8 @@ class Solver {
     g_timer.tic(tm_p_rhs);
     halo(Rz, lp_, hbA.p);
     const cplx* hR = hbA.p;
-    if (zcomp) zderiv(0, Rz, lp_, hR, DZ1.p);
-    const cplx* dzr = zcomp ? DZ1.p : nullptr;
+    ZDer dzr;
+    if (zcomp) dzr = zderiv(0, Rz, lp_, hR, DZ1.p, ZB1.p);
     // right-hand side  (B1 E r_y)_j - (A1 c)_j,  c = -(i kx r_x + D1z r_z) at interior points, 0 at the walls
     pfor(nsp, [=] HD(idx n) {
       const int i = int(n % nkx_);
@@ -989,7 +1019,7 @@ class Solver {
       auto cval = [&](int jj) -> cplx {
         if (jj <= 0 || jj >= ny_ - 1) return cplx(0, 0);
         cplx d = itimes(kx[i], Rx[(idx(jj) * nz_ + k) * lp_ + i]);
-        if (dzr) d += dzr[(idx(jj) * nz_ + k) * nkx_ + i];
+        if (dzr.valid()) d += dzr.at(jj, k, i);
         else
           for (int l = -z.h; l <= z.h; ++l) {
             if (l == 0) continue;
@@ -1023,8 +1053,8 @@ class Solver {
     g_timer.tic(tm_p_grad);
     halo(t1, nkx_, hbB.p);
     const cplx* hP = hbB.p;
-    if (zcomp) zderiv(0, t1, nkx_, hP, DZ1.p);
-    const cplx* dzp = zcomp ? DZ1.p : nullptr;
+    ZDer dzp;
+    if (zcomp) dzp = zderiv(0, t1, nkx_, hP, DZ1.p, ZB1.p);
     ydiff(0, T1.p, T2.p);  // D1y phi
     // u = r - grad phi
     cplx *U = u.p, *V = v.p, *Wv = w.p;
@@ -1038,7 +1068,7 @@ class Solver {
       }
       const idx o = kj * lp_ + i;
       cplx gz(0, 0);
-      if (dzp) gz = dzp[n];
+      if (dzp.valid()) gz = dzp.at(j, k, i);
       else
         for (int l = -z.h; l <= z.h; ++l) {
           if (l == 0) continue;
@@ -1355,8 +1385,8 @@ class Solver {
     ydiff(0, v.p, T1.p);
     halo(w.p, nkx, hbC.p);
     const cplx* hW = hbC.p;
-    if (zcomp) zderiv(0, w.p, nkx, hW, DZ1.p);
-    const cplx* dzw = zcomp ? DZ1.p : nullptr;
+    ZDer dzw;
+    if (zcomp) dzw = zderiv(0, w.p, nkx, hW, DZ1.p, ZB1.p);
     const cplx *U = u.p, *Wv = w.p, *dyv = T1.p;
     const real* kx = d_kx.p;
     const ZSt z = zs;
@@ -1365,7 +1395,7 @@ class Solver {
       const idx kj = n / nkx_;
       const int k = int(kj % nz_), j = int(kj / nz_);
       cplx d = itimes(kx[i], U[n]) + dyv[n];
-      if (dzw) d += dzw[n];
+      if (dzw.valid()) d += dzw.at(j, k, i);
       else
         for (int l = -z.h; l <= z.h; ++l) {
           if (l == 0) continue;

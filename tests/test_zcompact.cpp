@@ -65,8 +65,8 @@ int main(int argc, char** argv) {
           }
       S.u.upload(hu);
       S.halo(S.u.p, S.nkx, S.hbA.p);
-      S.zderiv(0, S.u.p, S.nkx, S.hbA.p, S.DZ1.p);
-      S.zderiv(1, S.u.p, S.nkx, S.hbA.p, S.DZ2.p);
+      S.zderiv_full(0, S.u.p, S.nkx, S.hbA.p, S.DZ1.p, S.ZB1.p);
+      S.zderiv_full(1, S.u.p, S.nkx, S.hbA.p, S.DZ2.p, S.ZB2.p);
       sync();
       std::vector<cplx> d1 = S.DZ1.host(), d2 = S.DZ2.host();
       double es1 = 0, es2 = 0, ee1 = 0, ee2 = 0, n1 = 0, n2 = 0;
