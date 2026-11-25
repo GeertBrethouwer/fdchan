@@ -96,7 +96,7 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `init_type` | laminar | `laminar`, `noise` (random large-scale modes, amplitude `init_amp`, `init_seed`), `mode` (a wave with kx index `mode_kx`, kz index `mode_kz`), `restart` |
 | `restart_file`, `reset_time` | restart.bin, false | for `init_type = restart` |
 | `data_dir` | data | output directory |
-| `iout_samples`, `tout_samples`, `tsamples_start`, `samples_dir` | 0, 0, 0, data_dir/samples | numbered restart files (time samples, e.g. for spectra with `rsspec` of the converter repository): `restart_t<time>.bin` every `iout_samples` steps and/or every `tout_samples` time units from `tsamples_start` on (0: off). Named by the time because the step count starts at 0 in every run; `tout_samples` gives evenly spaced samples across restarts (see Output) |
+| `iout_samples`, `tout_samples`, `tsamples_start`, `samples_dir` | 0, 0, 0, data_dir/samples | numbered restart files (time samples, e.g. for spectra with `rsspec` of the [converter_and_spectra](https://github.com/GeertBrethouwer/converter_and_spectra) repository): `restart_t<time>.bin` every `iout_samples` steps and/or every `tout_samples` time units from `tsamples_start` on (0: off). Named by the time because the step count starts at 0 in every run; `tout_samples` gives evenly spaced samples across restarts (see Output) |
 | `iout_log`, `iout_stats`, `iout_save_stats`, `iout_restart`, `tstats_start` | 100, 0, 0, 0, 0 | output intervals in steps |
 | `mode_log_kx`, `mode_log_kz` | −1, 0 | Fourier mode (kx index ≥ 0, kz index of either sign) whose energy is logged as `E_mode` (as HiCHAN; kx < 0: none) |
 | `timing`, `timing_sync` | false, true | timers as in HiCHAN: `timing_report.txt` and `timing_steps.dat` (see Output). `timing_sync` makes every timer wait for the GPU (exact attribution of the time to the parts) |
@@ -145,7 +145,7 @@ so the same tools read both.
   with the next multiple (no duplicate at its start). Point `samples_dir` of a chain of jobs to the same directory.
   Each file has the size of `restart.bin` (about 76 GB for 2560 × 385 × 1920 with one scalar in double
   precision): choose the interval with the disk quota in mind. Use them for restarts (`restart_file`) or for
-  spectra (`rsspec`, converter repository).
+  spectra (`rsspec`, [converter_and_spectra](https://github.com/GeertBrethouwer/converter_and_spectra) repository).
 * `restart.bin`: the spectral fields (kx, z, y) of u, v, w and the scalars, and the time; written at the end and
   every `iout_restart` steps. A file with fewer scalars (e.g. from a run without scalars) can be read: the missing
   scalars are initialised as given by `sinit`.
