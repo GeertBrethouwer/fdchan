@@ -285,6 +285,26 @@ int main(int argc, char** argv) {
     }
     std::fclose(f);
   };
+  // numbered restart files (time samples): named by the time, since the step count starts at 0 in every run
+  // (the restart file holds only the time); with tout_samples at the first step at or after each multiple
+  long last_k = -1;
+  if (P.tout_samples > 0) last_k = long(std::floor((S.time - P.tsamples_start) / P.tout_samples + 1e-9));
+  if (root && (P.iout_samples > 0 || P.tout_samples > 0)) mkdir(P.samples_dir.c_str(), 0755);
+  auto sample_due = [&]() {
+    if (S.time < P.tsamples_start - 1e-12) return false;
+    bool due = P.iout_samples > 0 && S.step % P.iout_samples == 0;
+    if (P.tout_samples > 0) {
+      const long k = long(std::floor((S.time - P.tsamples_start) / P.tout_samples + 1e-9));
+      if (k > last_k) { last_k = k; due = true; }
+    }
+    return due;
+  };
+  auto write_sample = [&]() {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/restart_t%011.4f.bin", S.time);
+    write_restart(S, P.samples_dir + name);
+    if (root) std::printf("sample    %s%s (t = %.6f, step %ld)\n", P.samples_dir.c_str(), name, S.time, S.step);
+  };
   g_comm.barrier();
   const auto w0 = std::chrono::steady_clock::now();
   auto wall = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(); };
@@ -310,6 +330,11 @@ int main(int argc, char** argv) {
     if (P.iout_restart > 0 && S.step % P.iout_restart == 0) {
       g_timer.tic(tm_io);
       write_restart(S, P.data_dir + "/restart.bin");
+      g_timer.toc(tm_io);
+    }
+    if (sample_due()) {
+      g_timer.tic(tm_io);
+      write_sample();
       g_timer.toc(tm_io);
     }
     // the same wall-clock decision on all ranks

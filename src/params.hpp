@@ -48,6 +48,11 @@ struct Params {
   std::string data_dir = "data";
   int iout_log = 100, iout_stats = 0, iout_save_stats = 0, iout_restart = 0;
   double tstats_start = 0;
+  // numbered restart files (time samples, e.g. for spectra): <samples_dir>/restart_t<time>.bin every iout_samples
+  // steps and/or every tout_samples of simulation time, from tsamples_start on (0: off)
+  int iout_samples = 0;
+  double tout_samples = 0, tsamples_start = 0;
+  std::string samples_dir;  // default: <data_dir>/samples
   int mode_log_kx = -1, mode_log_kz = 0;  // energy of one Fourier mode in log.dat (as HiCHAN; kx < 0: none)
   bool timing = false;       // timers: report at the end (timing_report.txt), time per step in timing_steps.dat
   bool timing_sync = true;   // timers wait for the GPU (exact attribution, a little overhead)
@@ -137,6 +142,8 @@ struct Params {
     I("mode_kz", mode_kz); S("restart_file", restart_file); S("mode_file", mode_file); B("reset_time", reset_time);
     S("data_dir", data_dir); I("iout_log", iout_log); I("iout_stats", iout_stats);
     I("iout_save_stats", iout_save_stats); I("iout_restart", iout_restart); D("tstats_start", tstats_start);
+    I("iout_samples", iout_samples); D("tout_samples", tout_samples); D("tsamples_start", tsamples_start);
+    S("samples_dir", samples_dir);
     I("mode_log_kx", mode_log_kx); I("mode_log_kz", mode_log_kz); B("timing", timing); B("timing_sync", timing_sync); B("fuse_y", fuse_y); S("comm_backend", comm_backend); I("nthreads", nthreads);
     I("nscal", nscal);
     DL("pr", pr, NSMAX); DL("scal_theta", scal_theta, NSMAX); DL("sval_bot", sval_bot, NSMAX); DL("sval_top", sval_top, NSMAX);
@@ -166,6 +173,8 @@ struct Params {
       if (pr[n] <= 0) fatal("pr must be > 0");
     }
     if (std::sqrt(gravity[0] * gravity[0] + gravity[1] * gravity[1] + gravity[2] * gravity[2]) == 0) fatal("gravity must not be zero");
+    if (iout_samples < 0 || tout_samples < 0) fatal("iout_samples, tout_samples must be >= 0");
+    if (samples_dir.empty()) samples_dir = data_dir + "/samples";
   }
   void print() const {
     std::printf("grid      nx = %d, ny = %d, nz = %d, lx = %.6g, lz = %.6g, %s (alpha = %g), order %d (y) %d (z), dealias %d\n",
@@ -174,6 +183,12 @@ struct Params {
     std::printf("time      nstep = %ld, tmax = %g, fixed_dt = %d, dt = %g, cfl = %g, cfl_visc = %g, rk_stages = %d\n",
                 nstep, tmax, int(fixed_dt), dt, cfl, cfl_visc, rk_stages);
     std::printf("init      %s, amp = %g\n", init_type.c_str(), init_amp);
+    if (iout_samples > 0 || tout_samples > 0) {
+      std::printf("samples   restart files restart_t<time>.bin in %s,", samples_dir.c_str());
+      if (iout_samples > 0) std::printf(" every %d steps", iout_samples);
+      if (tout_samples > 0) std::printf("%s every %g time units", iout_samples > 0 ? " and" : "", tout_samples);
+      std::printf(", from t = %g\n", tsamples_start);
+    }
     if (timing) std::printf("timing    on%s (timing_report.txt, timing_steps.dat)\n", timing_sync ? ", GPU-synchronised" : "");
     if (nscal > 0) {
       std::printf("scalars   %d, %s form; gravity (%g, %g, %g)\n", nscal, scal_form.c_str(), gravity[0], gravity[1], gravity[2]);
