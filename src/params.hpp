@@ -57,6 +57,8 @@ struct Params {
   bool timing = false;       // timers: report at the end (timing_report.txt), time per step in timing_steps.dat
   bool timing_sync = true;   // timers wait for the GPU (exact attribution, a little overhead)
   std::string comm_backend;  // nccl | mpi: halo exchanges and all-to-alls; default nccl if built with NCCL=1
+  bool overlap_scalars = false;  // scalars on their own GPU stream, at the same time as the pressure step
+  int p_chunks = 1;              // > 1: pipelined pressure step (all-to-alls of chunks overlapped with z-FFTs, solves)
   bool fuse_y = true;  // FDCHAN: y-derivatives formed inside the kernels that use them (one thread per line)
   // scalars (as HiCHAN's &scalars and &buoyancy; per-scalar values are comma- or space-separated lists, entries
   // not given keep the default)
@@ -144,7 +146,7 @@ struct Params {
     I("iout_save_stats", iout_save_stats); I("iout_restart", iout_restart); D("tstats_start", tstats_start);
     I("iout_samples", iout_samples); D("tout_samples", tout_samples); D("tsamples_start", tsamples_start);
     S("samples_dir", samples_dir);
-    I("mode_log_kx", mode_log_kx); I("mode_log_kz", mode_log_kz); B("timing", timing); B("timing_sync", timing_sync); B("fuse_y", fuse_y); S("comm_backend", comm_backend); I("nthreads", nthreads);
+    I("mode_log_kx", mode_log_kx); I("mode_log_kz", mode_log_kz); B("timing", timing); B("timing_sync", timing_sync); B("fuse_y", fuse_y); B("overlap_scalars", overlap_scalars); I("p_chunks", p_chunks); S("comm_backend", comm_backend); I("nthreads", nthreads);
     I("nscal", nscal);
     DL("pr", pr, NSMAX); DL("scal_theta", scal_theta, NSMAX); DL("sval_bot", sval_bot, NSMAX); DL("sval_top", sval_top, NSMAX);
     DL("ssrc_const", ssrc_const, NSMAX); DL("ssrc_u", ssrc_u, NSMAX); DL("ri", ri, NSMAX);
@@ -159,6 +161,7 @@ struct Params {
       fatal("nl_form must be rotational, advective, divergence or skew");
     if (fd_order_z == 0) fd_order_z = fd_order;
     if (comm_backend != "" && comm_backend != "nccl" && comm_backend != "mpi") fatal("comm_backend must be nccl or mpi");
+    if (p_chunks < 1) fatal("p_chunks must be >= 1");
     if (fd_order_z % 2 || fd_order_z < 2 || fd_order_z > 8) fatal("fd_order_z must be 2, 4, 6 or 8");
     if (z_scheme != "explicit" && z_scheme != "compact") fatal("z_scheme must be explicit or compact");
     if (z_scheme == "compact" && fd_order_z < 4) fatal("compact z_scheme: fd_order_z must be 4, 6 or 8");

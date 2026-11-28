@@ -183,6 +183,7 @@ class XFFT {
  private:
   void forward_(real* buf) {
 #ifdef FD_GPU
+    fftSetStream(pf_, g_stream);  // the current stream (see OnStream)
     if (fftExecR2C(pf_, (fftReal*)buf, (fftComplex*)buf) != FFT_SUCCESS) fatal("FFT exec (x, forward)");
 #else
     const int m = mx, l = lp, d = ld;
@@ -198,6 +199,7 @@ class XFFT {
   // complex (line stride lp) -> real (line stride ld), in place; Im of bin 0 (and bin mx/2) ignored
   void backward_(real* buf) {
 #ifdef FD_GPU
+    fftSetStream(pb_, g_stream);
     if (fftExecC2R(pb_, (fftComplex*)buf, (fftReal*)buf) != FFT_SUCCESS) fatal("FFT exec (x, backward)");
 #else
     const int m = mx, l = lp, d = ld;
@@ -252,6 +254,7 @@ class ZFFT {
     exec_(buf, sign);
     g_timer.toc(tm_zfft);
   }
+  void exec_untimed(cplx* buf, int sign) { exec_(buf, sign); }  // inside the pipelined pressure step
   ~ZFFT() {
 #ifdef FD_GPU
     if (nz) fftDestroy(p_);
@@ -261,6 +264,7 @@ class ZFFT {
  private:
   void exec_(cplx* buf, int sign) {
 #ifdef FD_GPU
+    fftSetStream(p_, g_stream);
     if (fftExecC2C(p_, (fftComplex*)buf, (fftComplex*)buf, sign < 0 ? FFT_FORWARD : FFT_INVERSE) != FFT_SUCCESS)
       fatal("FFT exec (z)");
 #else

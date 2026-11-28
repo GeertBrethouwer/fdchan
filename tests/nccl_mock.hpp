@@ -25,10 +25,11 @@ inline int& nccl_mock_depth() { static int d = 0; return d; }
 inline const char* ncclGetErrorString(ncclResult_t) { return "nccl mock error"; }
 inline ncclResult_t ncclGetUniqueId(ncclUniqueId* id) { for (char& c : id->internal) c = 0; return ncclSuccess; }
 inline ncclResult_t ncclCommInitRank(ncclComm_t* c, int, ncclUniqueId, int) {
-  *c = new ncclMockComm{MPI_COMM_WORLD};
+  *c = new ncclMockComm{MPI_COMM_NULL};
+  MPI_Comm_dup(MPI_COMM_WORLD, &(*c)->comm);  // separate matching, as separate NCCL communicators
   return ncclSuccess;
 }
-inline ncclResult_t ncclCommDestroy(ncclComm_t c) { delete c; return ncclSuccess; }
+inline ncclResult_t ncclCommDestroy(ncclComm_t c) { MPI_Comm_free(&c->comm); delete c; return ncclSuccess; }
 inline MPI_Datatype nccl_mock_type(ncclDataType_t t) { return t == ncclDouble ? MPI_DOUBLE : MPI_FLOAT; }
 inline ncclResult_t ncclGroupStart() { ++nccl_mock_depth(); return ncclSuccess; }
 inline ncclResult_t ncclGroupEnd() {

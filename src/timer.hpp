@@ -30,6 +30,7 @@ enum TimerId {
 
 struct Timer {
   bool on = false, sync_gpu = true;
+  bool paused = false;  // set while work for another stream is issued (overlap): no timing, no synchronisation
   double ttot[NTM] = {}, tbeg[NTM] = {};
   long ncall[NTM] = {};
 
@@ -37,12 +38,12 @@ struct Timer {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
   }
   void tic(int id) {
-    if (!on) return;
+    if (!on || paused) return;
     if (sync_gpu) sync();
     tbeg[id] = now();
   }
   void toc(int id) {
-    if (!on) return;
+    if (!on || paused) return;
     if (sync_gpu) sync();
     ttot[id] += now() - tbeg[id];
     ++ncall[id];

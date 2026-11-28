@@ -33,6 +33,12 @@
 #define gpuGetErrorString cudaGetErrorString
 #define gpuSuccess cudaSuccess
 #define gpuError_t cudaError_t
+#define gpuEvent_t cudaEvent_t
+#define gpuEventCreateWithFlags cudaEventCreateWithFlags
+#define gpuEventDisableTiming cudaEventDisableTiming
+#define gpuEventRecord cudaEventRecord
+#define gpuEventDestroy cudaEventDestroy
+#define gpuStreamWaitEvent cudaStreamWaitEvent
 #elif defined(FD_HIP)
 #include <hip/hip_runtime.h>
 #define FD_GPU 1
@@ -51,6 +57,12 @@
 #define gpuGetErrorString hipGetErrorString
 #define gpuSuccess hipSuccess
 #define gpuError_t hipError_t
+#define gpuEvent_t hipEvent_t
+#define gpuEventCreateWithFlags hipEventCreateWithFlags
+#define gpuEventDisableTiming hipEventDisableTiming
+#define gpuEventRecord hipEventRecord
+#define gpuEventDestroy hipEventDestroy
+#define gpuStreamWaitEvent hipStreamWaitEvent
 #else
 #define HD
 #include <atomic>
@@ -69,9 +81,18 @@ using real = double;
 #endif
 using idx = long long;
 
+// set by Comm::init with several MPI ranks: an error on one rank stops all of them (MPI_Abort), instead of
+// leaving the others waiting in a collective
+inline void (*g_abort)(int) = nullptr;
+[[noreturn]] inline void stop(int code) {
+  std::fflush(stdout);
+  std::fflush(stderr);
+  if (g_abort) g_abort(code);
+  std::exit(code);
+}
 [[noreturn]] inline void fatal(const char* msg) {
   std::fprintf(stderr, "fdchan error: %s\n", msg);
-  std::exit(1);
+  stop(1);
 }
 
 // ------------------------------------------------------------------ complex numbers
@@ -100,13 +121,55 @@ extern gpuStream_t g_stream;
 inline void gpu_check(gpuError_t e, const char* where) {
   if (e != gpuSuccess) {
     std::fprintf(stderr, "GPU error in %s: %s\n", where, gpuGetErrorString(e));
-    std::exit(1);
+    stop(1);
   }
 }
 inline void sync() { gpu_check(gpuStreamSynchronize(g_stream), "sync"); }
+using stream_t = gpuStream_t;
 #else
 inline void sync() {}
+using stream_t = int;
 #endif
+
+// ------------------------------------------------------------------ streams and events
+// Every launch (pfor and the other kernels, FFTs, copies, NCCL) goes to the stream in g_stream. OnStream switches
+// it for a scope; Event orders two streams on the GPU (record on one, wait on another) without blocking the host.
+// On the CPU everything runs in program order and both are no-ops.
+struct OnStream {
+#ifdef FD_GPU
+  stream_t old;
+  explicit OnStream(stream_t s) : old(g_stream) { g_stream = s; }
+  ~OnStream() { g_stream = old; }
+#else
+  explicit OnStream(stream_t) {}
+#endif
+  OnStream(const OnStream&) = delete;
+  OnStream& operator=(const OnStream&) = delete;
+};
+struct Event {
+#ifdef FD_GPU
+  gpuEvent_t e{};
+  Event() { gpu_check(gpuEventCreateWithFlags(&e, gpuEventDisableTiming), "event"); }
+  ~Event() { gpuEventDestroy(e); }
+  void record() { gpu_check(gpuEventRecord(e, g_stream), "event record"); }  // on the current stream
+  void wait() { gpu_check(gpuStreamWaitEvent(g_stream, e, 0), "event wait"); }  // the current stream waits
+#else
+  Event() {}
+  void record() {}
+  void wait() {}
+#endif
+  Event(const Event&) = delete;
+  Event& operator=(const Event&) = delete;
+};
+inline stream_t new_stream() {
+#ifdef FD_GPU
+  stream_t s;
+  gpu_check(gpuStreamCreate(&s), "stream");
+  return s;
+#else
+  return 0;
+#endif
+}
 
 template <class T>
 struct DArray {

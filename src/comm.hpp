@@ -40,12 +40,17 @@ struct Comm {
 #ifdef FD_MPI
   MPI_Comm comm = MPI_COMM_WORLD;
 #endif
+  // channel 0: the solver's main work; channel 1: the scalars when they run on their own stream (overlap_scalars).
+  // With NCCL each channel has its own communicator: operations of one communicator must not run at the same time
+  // from two streams. MPI calls are made by the host in program order on both channels.
+  int channel = 0;
 #ifdef FD_NCCL
-  ncclComm_t nccl = nullptr;
+  ncclComm_t nccl = nullptr, nccl2 = nullptr;
+  ncclComm_t cur() const { return channel == 1 && nccl2 ? nccl2 : nccl; }
   static void nccl_check(ncclResult_t r, const char* where) {
     if (r != ncclSuccess) {
       std::fprintf(stderr, "NCCL error in %s: %s\n", where, ncclGetErrorString(r));
-      std::exit(1);
+      stop(1);
     }
   }
   static ncclDataType_t nccl_real() { return sizeof(real) == 8 ? ncclDouble : ncclFloat; }
@@ -70,11 +75,22 @@ struct Comm {
     if (use_nccl) fatal("comm_backend = nccl: build with NCCL=1");
 #endif
   }
+  // the communicator of channel 1 (overlap_scalars)
+  void init_nccl2() {
+#ifdef FD_NCCL
+    if (!use_nccl || nccl2) return;
+    ncclUniqueId id;
+    if (rank == 0) nccl_check(ncclGetUniqueId(&id), "ncclGetUniqueId");
+    MPI_Bcast(&id, int(sizeof(id)), MPI_BYTE, 0, comm);
+    nccl_check(ncclCommInitRank(&nccl2, size, id, rank), "ncclCommInitRank (channel 1)");
+#endif
+  }
   void init(int* argc, char*** argv) {
 #ifdef FD_MPI
     MPI_Init(argc, argv);
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
+    if (size > 1) g_abort = [](int code) { MPI_Abort(MPI_COMM_WORLD, code); };
 #else
     (void)argc; (void)argv;
 #endif
@@ -82,6 +98,7 @@ struct Comm {
   void finalize() {
 #ifdef FD_NCCL
     if (nccl) { sync(); ncclCommDestroy(nccl); nccl = nullptr; }
+    if (nccl2) { ncclCommDestroy(nccl2); nccl2 = nullptr; }
 #endif
 #ifdef FD_MPI
     MPI_Finalize();
@@ -132,8 +149,8 @@ struct Comm {
     if (use_nccl) {
       (void)tag;  // NCCL matches the operations between two ranks in the order they are issued
       nccl_check(ncclGroupStart(), "ncclGroupStart");
-      nccl_check(ncclSend(sb, size_t(n), nccl_real(), dest, nccl, FD_NCCL_STREAM), "ncclSend (halo)");
-      nccl_check(ncclRecv(rb, size_t(n), nccl_real(), src, nccl, FD_NCCL_STREAM), "ncclRecv (halo)");
+      nccl_check(ncclSend(sb, size_t(n), nccl_real(), dest, cur(), FD_NCCL_STREAM), "ncclSend (halo)");
+      nccl_check(ncclRecv(rb, size_t(n), nccl_real(), src, cur(), FD_NCCL_STREAM), "ncclRecv (halo)");
       nccl_check(ncclGroupEnd(), "ncclGroupEnd");
       return;
     }
@@ -144,10 +161,32 @@ struct Comm {
     MPI_Sendrecv(sb, int(n), T, dest, tag, rb, int(n), T, src, tag, comm, MPI_STATUS_IGNORE);
 #endif
   }
+  // two exchanges at once (the two directions of a halo exchange): send s1 (n reals) to d1 and receive r1 from
+  // o1, send s2 to d2 and receive r2 from o2; with NCCL in one group (one launch instead of two)
+  void sendrecv2(const real* s1, real* r1, int d1, int o1, const real* s2, real* r2, int d2, int o2, idx n) const {
+    if (d1 == rank && o1 == rank && d2 == rank && o2 == rank) {
+      dcopy(r1, s1, sizeof(real) * size_t(n));
+      dcopy(r2, s2, sizeof(real) * size_t(n));
+      return;
+    }
+#ifdef FD_NCCL
+    if (use_nccl) {
+      nccl_check(ncclGroupStart(), "ncclGroupStart");
+      nccl_check(ncclSend(s1, size_t(n), nccl_real(), d1, cur(), FD_NCCL_STREAM), "ncclSend (halo)");
+      nccl_check(ncclRecv(r1, size_t(n), nccl_real(), o1, cur(), FD_NCCL_STREAM), "ncclRecv (halo)");
+      nccl_check(ncclSend(s2, size_t(n), nccl_real(), d2, cur(), FD_NCCL_STREAM), "ncclSend (halo)");
+      nccl_check(ncclRecv(r2, size_t(n), nccl_real(), o2, cur(), FD_NCCL_STREAM), "ncclRecv (halo)");
+      nccl_check(ncclGroupEnd(), "ncclGroupEnd");
+      return;
+    }
+#endif
+    sendrecv(s1, n, d1, r1, o1, 11);
+    sendrecv(s2, n, d2, r2, o2, 12);
+  }
   // all-to-all with counts/displacements in reals
   void alltoallv(const real* sb, const std::vector<int>& sc, const std::vector<int>& sd, real* rb,
                  const std::vector<int>& rc, const std::vector<int>& rd) const {
-    if (size == 1) { dcopy(rb, sb, sizeof(real) * size_t(sc[0])); return; }
+    if (size == 1) { dcopy(rb + rd[0], sb + sd[0], sizeof(real) * size_t(sc[0])); return; }
 #ifdef FD_NCCL
     if (use_nccl) {
       const size_t me = size_t(rank);
@@ -156,8 +195,8 @@ struct Comm {
       for (int r = 0; r < size; ++r) {
         if (r == rank) continue;
         const size_t q = size_t(r);
-        if (sc[q] > 0) nccl_check(ncclSend(sb + sd[q], size_t(sc[q]), nccl_real(), r, nccl, FD_NCCL_STREAM), "ncclSend (all-to-all)");
-        if (rc[q] > 0) nccl_check(ncclRecv(rb + rd[q], size_t(rc[q]), nccl_real(), r, nccl, FD_NCCL_STREAM), "ncclRecv (all-to-all)");
+        if (sc[q] > 0) nccl_check(ncclSend(sb + sd[q], size_t(sc[q]), nccl_real(), r, cur(), FD_NCCL_STREAM), "ncclSend (all-to-all)");
+        if (rc[q] > 0) nccl_check(ncclRecv(rb + rd[q], size_t(rc[q]), nccl_real(), r, cur(), FD_NCCL_STREAM), "ncclRecv (all-to-all)");
       }
       nccl_check(ncclGroupEnd(), "ncclGroupEnd");
       return;

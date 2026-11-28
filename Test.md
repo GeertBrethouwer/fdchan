@@ -216,6 +216,25 @@ x-FFT (advective form; 4 + 4 for divergence and skew), one halo exchange (two fo
 y-solve (local, no communication). Expect each scalar to cost about a third to a half of the velocity's nonlinear
 terms.
 
+### 3.6 Overlap of communication and computation (`overlap_scalars`, `p_chunks`)
+
+`examples/arrhenius_overlap_test.sh` runs a production case four times from its restart file (`RUN`, nothing in
+it is changed): as in the input, with `overlap_scalars = 1`, with `p_chunks = 4`, and with both, and compares them:
+
+```bash
+sbatch -A <your-account> --export=ALL,RUN=/scratch/geert/fdchan_run $HOME/fdchan/examples/arrhenius_overlap_test.sh
+```
+
+Expected: `overlap_scalars` gives a `log.dat` identical to the run without it; `p_chunks` agrees in all printed
+digits except max|div| (the chunks' z-FFT plans may round differently); the summary gives the time per step.
+On the CPU (where the work is not concurrent, but the order and buffers are the same) every option was checked bit
+for bit against the version before, built without fused multiply-adds (`-ffp-contract=off`): 1, 2, 3 ranks, MPI and
+the NCCL stand-in, explicit and compact z, two scalars (buoyant, skew form, Neumann wall).
+
+Also new: the halos of u, v, w go in one exchange, both directions of every halo and compact-z exchange in one NCCL
+group (fewer, larger messages; identical results), and an error on one rank (e.g. an input that does not fit the
+number of ranks) stops all ranks at once with MPI_Abort instead of leaving them waiting.
+
 ## 4. Performance
 
 All runs with `timing = 1` in the input: at the end FDCHAN prints the same kind of timing report as HiCHAN

@@ -101,6 +101,8 @@ The input is a text file with `key = value` lines (`!` or `#` start a comment); 
 | `mode_log_kx`, `mode_log_kz` | −1, 0 | Fourier mode (kx index ≥ 0, kz index of either sign) whose energy is logged as `E_mode` (as HiCHAN; kx < 0: none) |
 | `timing`, `timing_sync` | false, true | timers as in HiCHAN: `timing_report.txt` and `timing_steps.dat` (see Output). `timing_sync` makes every timer wait for the GPU (exact attribution of the time to the parts) |
 | `comm_backend` | nccl (NCCL=1 builds), else mpi | `nccl` or `mpi` for the halo exchanges and all-to-alls; `mpi` needs a CUDA-aware MPI |
+| `overlap_scalars` | false | the scalars (their nonlinear terms and implicit update) on their own GPU stream, at the same time as the pressure step, whose time is mostly the all-to-alls. Own scratch arrays (2 fields, 4 with compact z) and NCCL communicator. Same results to the last bit (CPU test; on the GPU: `examples/arrhenius_overlap_test.sh`) |
+| `p_chunks` | 1 | > 1: pipelined pressure step. The local kx of the kx-slab are split into this many chunks; the all-to-all of each chunk runs on its own stream while the z-FFTs and banded solves of the previous chunk are computed, and the chunks go back while the next one is solved. Try 4; the parts of the pressure step are then not timed separately. Same results (to round-off in the z-FFTs on the GPU) |
 | `fuse_y` | true | form the y-derivatives inside the kernels that use them (one thread per y-line, no derivative arrays written and read back; as x3d2's fused transport kernels). `false`: separate derivative and pointwise kernels. Same results to the last bit |
 | `nthreads` | all cores | CPU build only (threads per rank) |
 

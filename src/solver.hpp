@@ -260,6 +260,21 @@ class Solver {
   DArray<real> Pb[10];  // 6 always, 3 more for the advective form or the scalars, 1 more for scalar_form divergence/skew
   DArray<double> d_prof, d_scal;
   DArray<cplx> hbA, hbB, hbC, hsend, sbuf, rbuf;  // halo buffers, transpose buffers
+  DArray<cplx> hrecv;  // halo3: the received planes of u, v, w (hsend holds 3 fields)
+  // overlap_scalars: the scalars run on stream s_scal with their own scratch arrays (swapped with the main ones while
+  // their work is issued, see ScalarContext) and NCCL communicator (channel 1); s_comm: pipelined pressure step
+  bool ovs = false;
+  stream_t s_scal{}, s_comm{};
+  DArray<cplx> T1s, T2s, hsend_s, DZ1s, DZ2s, ZB1s, ZB2s, d_zx_s;
+  Event ev_rhs, ev_scal, ev_pack, ev_done;
+  // p_chunks > 1: chunks of the local kx (pressure step); layouts in setup_pipe
+  int pch = 1;
+  std::vector<int> kc0;                                  // local kx start of chunk c (c = 0..pch)
+  std::vector<std::vector<int>> c_sc, c_sd, c_rc, c_rd;  // per chunk: all-to-all counts and displacements (reals)
+  DArray<int> d_kxch, d_kxco, d_ncc;                     // per global kx: chunk, offset in it; per (c, r): kx count
+  DArray<idx> d_sdc, d_rdc;                              // per (c, r): send / receive block start (complex)
+  std::vector<std::unique_ptr<ZFFT>> zfc;                // z-FFT plan per chunk
+  std::vector<std::unique_ptr<Event>> evF, evB;
   DArray<int> d_kxown, d_kxoff, d_zown, d_zoff;
   std::vector<int> a2a_sc, a2a_sd, a2a_rc, a2a_rd;  // all-to-all counts and displacements (in reals)
   DArray<idx> d_sd, d_rd;
@@ -314,7 +329,7 @@ class Solver {
     sbuf.alloc(std::max(nsp, nt2));
     rbuf.alloc(std::max(nsp, nt2));
     const idx nh = 2 * idx(hz_halo) * ny * nkx;
-    hbA.alloc(nh); hbB.alloc(nh); hbC.alloc(nh); hsend.alloc(nh);
+    hbA.alloc(nh); hbB.alloc(nh); hbC.alloc(nh); hsend.alloc(3 * nh); hrecv.alloc(3 * nh);
     if (nsc > 0) {
       hbS.alloc(nh);
       for (int n = 0; n < nsc; ++n) { Sf[n].alloc(nsp); NSf[n].alloc(nsp); NSo[n].alloc(nsp); kap[n] = nu / P.pr[n]; }
@@ -337,6 +352,158 @@ class Solver {
     xfft.init(mx, idx(nz) * ny);
     zfft.init(nzg, idx(nkl) * ny);
     dt = P.dt;
+    // overlap of the scalars with the pressure step
+    ovs = P.overlap_scalars && nsc > 0;
+    if (ovs) {
+      s_scal = new_stream();
+      g_comm.init_nccl2();
+      T1s.alloc(nsp); T2s.alloc(nsp); hsend_s.alloc(3 * nh);
+      if (zcomp) {
+        DZ1s.alloc(nsp); DZ2s.alloc(nsp);
+        d_zx_s.alloc(4 * idx(ny) * nkx);
+        ZB1s.alloc(2 * idx(ny) * nkx); ZB2s.alloc(2 * idx(ny) * nkx);
+      }
+    }
+    setup_pipe();
+  }
+  static void swap_arr(DArray<cplx>& a, DArray<cplx>& b) { std::swap(a.p, b.p); std::swap(a.n, b.n); }
+  void swap_scalar_scratch() {
+    swap_arr(T1, T1s); swap_arr(T2, T2s); swap_arr(hsend, hsend_s);
+    if (zcomp) { swap_arr(DZ1, DZ1s); swap_arr(DZ2, DZ2s); swap_arr(ZB1, ZB1s); swap_arr(ZB2, ZB2s); swap_arr(d_zx, d_zx_s); }
+  }
+  // while it exists, the work issued goes to the scalar stream, with the scalar scratch arrays and NCCL channel 1;
+  // kernels take their pointers when they are issued, so the arrays can be swapped back right after
+  struct ScalarContext {
+    Solver& S;
+    OnStream os;
+    explicit ScalarContext(Solver& s) : S(s), os(s.s_scal) {
+      S.swap_scalar_scratch();
+      g_comm.channel = 1;
+      g_timer.paused = true;  // no timers (they would make the host wait for this stream)
+    }
+    ~ScalarContext() {
+      g_timer.paused = false;
+      g_comm.channel = 0;
+      S.swap_scalar_scratch();
+    }
+  };
+
+  // p_chunks > 1: the local kx of the pressure step in chunks. Send block of chunk c to rank r: (j, i'', k) with
+  // i'' the kx of chunk c of r's kx-slab, k local; receive block of chunk c from rank s: (j, i'', k_s) with i'' in my
+  // chunk c. Blocks are ordered chunk by chunk, so every chunk is one all-to-all with its own displacements. In the
+  // kx-slab the pipelined step keeps T2 as (i, j, k global): a chunk is contiguous there.
+  void setup_pipe() {
+    pch = 1;
+    if (P.p_chunks <= 1) return;
+    int mincnt = nkx;
+    for (int r = 0; r < nrank; ++r) mincnt = std::min(mincnt, kxst[size_t(r + 1)] - kxst[size_t(r)]);
+    pch = std::max(1, std::min(P.p_chunks, mincnt));
+    if (pch == 1) return;
+    s_comm = new_stream();
+    const int C = pch;
+    auto cnt = [&](int r) { return kxst[size_t(r + 1)] - kxst[size_t(r)]; };
+    auto cst = [&](int r, int c) { return block_start(cnt(r), C, c); };   // chunk start in r's kx-slab
+    kc0.resize(size_t(C + 1));
+    for (int c = 0; c <= C; ++c) kc0[size_t(c)] = cst(myrank, c);
+    std::vector<idx> sdc(size_t(C) * nrank), rdc(size_t(C) * nrank);
+    std::vector<int> ncc(size_t(C) * nrank);
+    c_sc.assign(size_t(C), std::vector<int>(size_t(nrank), 0)); c_sd = c_sc; c_rc = c_sc; c_rd = c_sc;
+    idx so = 0, ro = 0;
+    for (int c = 0; c < C; ++c)
+      for (int r = 0; r < nrank; ++r) {
+        const int nr_c = cst(r, c + 1) - cst(r, c), nme = kc0[size_t(c + 1)] - kc0[size_t(c)];
+        const int nzr = zst[size_t(r + 1)] - zst[size_t(r)];
+        const idx ns = idx(ny) * nr_c * nz, nrv = idx(ny) * nme * nzr;
+        ncc[size_t(c) * nrank + r] = nr_c;
+        sdc[size_t(c) * nrank + r] = so; rdc[size_t(c) * nrank + r] = ro;
+        c_sc[size_t(c)][size_t(r)] = int(2 * ns); c_sd[size_t(c)][size_t(r)] = int(2 * so);
+        c_rc[size_t(c)][size_t(r)] = int(2 * nrv); c_rd[size_t(c)][size_t(r)] = int(2 * ro);
+        so += ns; ro += nrv;
+      }
+    std::vector<int> kxch(static_cast<size_t>(nkx)), kxco(static_cast<size_t>(nkx));
+    for (int r = 0; r < nrank; ++r)
+      for (int c = 0; c < C; ++c)
+        for (int o = cst(r, c); o < cst(r, c + 1); ++o) {
+          const int i = kxst[size_t(r)] + o;
+          kxch[size_t(i)] = c; kxco[size_t(i)] = o - cst(r, c);
+        }
+    d_kxch.alloc(nkx); d_kxch.upload(kxch);
+    d_kxco.alloc(nkx); d_kxco.upload(kxco);
+    d_ncc.alloc(idx(ncc.size())); d_ncc.upload(ncc);
+    d_sdc.alloc(idx(sdc.size())); d_sdc.upload(sdc);
+    d_rdc.alloc(idx(rdc.size())); d_rdc.upload(rdc);
+    for (int c = 0; c < C; ++c) {
+      zfc.emplace_back(new ZFFT());
+      zfc.back()->init(nzg, idx(kc0[size_t(c + 1)] - kc0[size_t(c)]) * ny);
+      evF.emplace_back(new Event());
+      evB.emplace_back(new Event());
+    }
+  }
+
+  // the pipelined middle of project(): t1 (kx, z local, y) -> kx-slabs -> z-FFT, banded solves, inverse z-FFT ->
+  // back to t1, chunk by chunk. The all-to-alls run on s_comm in the order F_0 .. F_{C-1}, B_0 .. B_{C-1} (the
+  // same on all ranks); chunk c is computed on the main stream when F_c has arrived, while the later chunks are
+  // still in transit, and B_c is sent while chunk c + 1 is computed.
+  void pressure_pipe(cplx* t1) {
+    const int C = pch, nkx_ = nkx, nz_ = nz, ny_ = ny, nzg_ = nzg, nr = nrank;
+    const int *own = d_kxown.p, *zown = d_zown.p, *zoff = d_zoff.p, *nzr = d_nzr.p;
+    const int *kxch = d_kxch.p, *kxco = d_kxco.p, *ncc = d_ncc.p;
+    const idx *sdc = d_sdc.p, *rdc = d_rdc.p;
+    cplx *sb = sbuf.p, *rb = rbuf.p, *t2 = T2.p;
+    real *sbr = reinterpret_cast<real*>(sb), *rbr = reinterpret_cast<real*>(rb);
+    ptranspose(ny, nz_, nkx_,
+        [=] HD(idx j, int k, int i) -> cplx { return t1[(j * nz_ + k) * nkx_ + i]; },
+        [=] HD(idx j, int k, int i, cplx val) {
+          const int r = own[i], c = kxch[i];
+          const idx b = idx(c) * nr + r;
+          sb[sdc[b] + (j * ncc[b] + kxco[i]) * nz_ + k] = val;
+        });
+    ev_pack.record();
+    {
+      OnStream os(s_comm);
+      ev_pack.wait();
+      for (int c = 0; c < C; ++c) {
+        g_comm.alltoallv(sbr, c_sc[size_t(c)], c_sd[size_t(c)], rbr, c_rc[size_t(c)], c_rd[size_t(c)]);
+        evF[size_t(c)]->record();
+      }
+    }
+    for (int c = 0; c < C; ++c) {
+      const int i0 = kc0[size_t(c)], ncl = kc0[size_t(c + 1)] - i0;
+      const idx rbase = idx(c) * nr;
+      evF[size_t(c)]->wait();
+      // chunk c into T2 as (i, j, k global)
+      pfor(idx(ncl) * ny_ * nzg_, [=] HD(idx m) {
+        const int kg = int(m % nzg_);
+        const idx r = m / nzg_;
+        const int j = int(r % ny_), ic = int(r / ny_);
+        const int s = zown[kg];
+        t2[(idx(i0 + ic) * ny_ + j) * nzg_ + kg] = rb[rdc[rbase + s] + (idx(j) * ncl + ic) * nzr[s] + zoff[kg]];
+      });
+      cplx* tc = t2 + idx(i0) * ny_ * nzg_;
+      zfc[size_t(c)]->exec_untimed(tc, -1);
+      solve_columns(idx(i0) * ntz, idx(i0 + ncl) * ntz, true);
+      zfc[size_t(c)]->exec_untimed(tc, +1);
+      pfor(idx(ncl) * ny_ * nzg_, [=] HD(idx m) {
+        const int kg = int(m % nzg_);
+        const idx r = m / nzg_;
+        const int j = int(r % ny_), ic = int(r / ny_);
+        const int s = zown[kg];
+        rb[rdc[rbase + s] + (idx(j) * ncl + ic) * nzr[s] + zoff[kg]] = t2[(idx(i0 + ic) * ny_ + j) * nzg_ + kg];
+      });
+      evB[size_t(c)]->record();
+      OnStream os(s_comm);
+      evB[size_t(c)]->wait();
+      g_comm.alltoallv(rbr, c_rc[size_t(c)], c_rd[size_t(c)], sbr, c_sc[size_t(c)], c_sd[size_t(c)]);
+      if (c == C - 1) ev_done.record();
+    }
+    ev_done.wait();
+    ptranspose(ny, nkx_, nz_,
+        [=] HD(idx j, int i, int k) -> cplx {
+          const int r = own[i], c = kxch[i];
+          const idx b = idx(c) * nr + r;
+          return sb[sdc[b] + (j * ncc[b] + kxco[i]) * nz_ + k];
+        },
+        [=] HD(idx j, int i, int k, cplx val) { t1[(j * nz_ + k) * nkx_ + i] = val; });
   }
 
   // ---------------------------------------------------------------- set-up
@@ -465,8 +632,8 @@ class Solver {
     if (!single) {
       g_timer.tic(tm_halo);
       const int up = (myrank + 1) % nrank, dn = (myrank - 1 + nrank) % nrank;
-      g_comm.sendrecv(reinterpret_cast<const real*>(slast), 2 * nlines, up, reinterpret_cast<real*>(rprev), dn, 21);
-      g_comm.sendrecv(reinterpret_cast<const real*>(sfirst), 2 * nlines, dn, reinterpret_cast<real*>(rnext), up, 22);
+      g_comm.sendrecv2(reinterpret_cast<const real*>(slast), reinterpret_cast<real*>(rprev), up, dn,
+                       reinterpret_cast<const real*>(sfirst), reinterpret_cast<real*>(rnext), dn, up, 2 * nlines);
       g_timer.toc(tm_halo);
     }
     // 3: x_{-1}, x_n from the 2x2 systems at the block boundaries (x = y + x_{-1} p + x_n q where it is read)
@@ -706,10 +873,44 @@ class Solver {
     });
     const int up = (myrank + 1) % nrank, dn = (myrank - 1 + nrank) % nrank;
     g_timer.tic(tm_halo);
-    // my upper planes -> upper neighbour's lower halo; receive my lower halo from the lower neighbour
-    g_comm.sendrecv(reinterpret_cast<const real*>(sb), 2 * part, up, reinterpret_cast<real*>(hal), dn, 11);
-    g_comm.sendrecv(reinterpret_cast<const real*>(sb + part), 2 * part, dn, reinterpret_cast<real*>(hal + part), up, 12);
+    // my upper planes -> upper neighbour's lower halo, receive my lower halo from the lower neighbour; and the
+    // other way round; both in one exchange
+    g_comm.sendrecv2(reinterpret_cast<const real*>(sb), reinterpret_cast<real*>(hal), up, dn,
+                     reinterpret_cast<const real*>(sb + part), reinterpret_cast<real*>(hal + part), dn, up, 2 * part);
     g_timer.toc(tm_halo);
+  }
+  // the halos of three fields (line length nkx) in one exchange: hsend holds [side][field][planes]
+  void halo3(const cplx* f0, const cplx* f1, const cplx* f2, cplx* h0, cplx* h1, cplx* h2) {
+    const int h = hz_halo, nz_ = nz, W = nkx;
+    const idx part = idx(ny) * h * W, L = nkx;
+    cplx *sb = hsend.p, *rv = hrecv.p;
+    pfor(6 * part, [=] HD(idx n) {
+      const int side = int(n / (3 * part));
+      const idx rem = n - side * 3 * part;
+      const int fl = int(rem / part);
+      const idx m = rem - fl * part;
+      const int i = int(m % W);
+      const idx r = m / W;
+      const int q = int(r % h);
+      const idx j = r / h;
+      int k = side == 0 ? nz_ - h + q : q;
+      k %= nz_; if (k < 0) k += nz_;
+      const cplx* f = fl == 0 ? f0 : fl == 1 ? f1 : f2;
+      sb[n] = f[(j * nz_ + k) * L + i];
+    });
+    const int up = (myrank + 1) % nrank, dn = (myrank - 1 + nrank) % nrank;
+    g_timer.tic(tm_halo);
+    g_comm.sendrecv2(reinterpret_cast<const real*>(sb), reinterpret_cast<real*>(rv), up, dn,
+                     reinterpret_cast<const real*>(sb + 3 * part), reinterpret_cast<real*>(rv + 3 * part), dn, up, 6 * part);
+    g_timer.toc(tm_halo);
+    pfor(6 * part, [=] HD(idx n) {
+      const int side = int(n / (3 * part));
+      const idx rem = n - side * 3 * part;
+      const int fl = int(rem / part);
+      const idx m = rem - fl * part;
+      cplx* hal = fl == 0 ? h0 : fl == 1 ? h1 : h2;
+      hal[side * part + m] = rv[n];
+    });
   }
 
   void print_setup() const {
@@ -734,6 +935,15 @@ class Solver {
     if (nsc > 0)
       std::printf("scalars   %d, %s form; implicit y-systems: band %d+%d, Neumann rows of D1 with %d/%d entries\n", nsc,
                   P.scal_form.c_str(), skl, sku, nc1, ncn);
+    if (ovs || pch > 1) {
+      double ex = 0;  // extra arrays of the overlap options
+      if (ovs) ex += (2.0 * nsp + (zcomp ? 2.0 * nsp : 0.0)) * 2 * mb;
+      std::printf("overlap   %s%s%s; +%.1f MB for the scalar arrays (plus the z-FFT plans of the chunks)\n",
+                  ovs ? "scalars on their own stream" : "", ovs && pch > 1 ? ", " : "",
+                  pch > 1 ? ("pressure step in " + std::to_string(pch) + " chunks").c_str() : "", ex);
+    } else if (P.p_chunks > 1) {
+      std::printf("overlap   p_chunks = %d: not used (fewer kx per rank than chunks would need; at least 2)\n", P.p_chunks);
+    }
     std::printf("memory    %.1f MB of field arrays on rank 0 (%.0f bytes per local grid point)\n", tot,
                 tot * 1048576.0 / (double(nx) * ny * nz));
   }
@@ -1115,9 +1325,11 @@ class Solver {
     for (int s = 0; s < ns; ++s) {
       g_timer.tic(tm_nl);
       nonlinear();
-      g_timer.tic(tm_snl);
-      scalar_nonlinear();
-      g_timer.toc(tm_snl);
+      if (!ovs) {
+        g_timer.tic(tm_snl);
+        scalar_nonlinear();
+        g_timer.toc(tm_snl);
+      }
       g_timer.toc(tm_nl);
       if (s == 0) {
         g_timer.tic(tm_dt);
@@ -1127,6 +1339,19 @@ class Solver {
       g_timer.tic(tm_rhs);
       rhs(gam[s] * dt, zet[s] * dt);
       g_timer.toc(tm_rhs);
+      if (ovs) {
+        // the scalar terms and update on their own stream, at the same time as the pressure step: they need the
+        // physical velocities of nonlinear() (P0..P2, untouched until the next stage) and the scalars that rhs()
+        // has read for the buoyancy
+        ev_rhs.record();
+        {
+          ScalarContext ctx(*this);
+          ev_rhs.wait();
+          scalar_nonlinear();
+          scalar_update(gam[s] * dt, zet[s] * dt);
+          ev_scal.record();
+        }
+      }
       g_timer.tic(tm_p);
       project();
       g_timer.toc(tm_p);
@@ -1135,7 +1360,8 @@ class Solver {
         cfr_correct();
         g_timer.toc(tm_cfr);
       }
-      scalar_update(gam[s] * dt, zet[s] * dt);
+      if (!ovs) scalar_update(gam[s] * dt, zet[s] * dt);
+      else ev_scal.wait();  // the next stage overwrites P0..P2 and uses the scalars
     }
     // u = r - grad phi with r = u + dt (gam H + zet H_old): phi = (gam + zet) dt p for the last stage
     pscale = 1.0 / ((gam[ns - 1] + zet[ns - 1]) * dt);
@@ -1199,9 +1425,7 @@ class Solver {
 
   // 1-2: nonlinear term u x omega in P3..P5 (spectral, padded, unnormalised)
   void nonlinear() {
-    halo(u.p, nkx, hbA.p);  // halos of u, v, w for this stage (z-derivatives here and in rhs())
-    halo(v.p, nkx, hbB.p);
-    halo(w.p, nkx, hbC.p);
+    halo3(u.p, v.p, w.p, hbA.p, hbB.p, hbC.p);  // halos of u, v, w for this stage (z-derivatives here and in rhs())
     if (P.nl_form == "advective") { nonlinear_advective(); return; }
     const int nkx_ = nkx, lp_ = lp, ld_ = ld, mx_ = mx, nz_ = nz, ny_ = ny;
     VortPoint pt;
@@ -1456,14 +1680,18 @@ class Solver {
       t1[n] = s;
     });
     g_timer.toc(tm_p_rhs);
-    // (kx, z local, y) -> (z global, kx local, y): all-to-all to the kx-slabs
-    transpose_to_kx(t1, t2);
-    zfft.exec(T2.p, -1);
-    g_timer.tic(tm_p_lu);
-    solve_columns();
-    g_timer.toc(tm_p_lu);
-    zfft.exec(T2.p, +1);
-    transpose_to_z(t2, t1);
+    if (pch > 1) {
+      pressure_pipe(t1);  // chunks; the parts are not timed separately (they overlap)
+    } else {
+      // (kx, z local, y) -> (z global, kx local, y): all-to-all to the kx-slabs
+      transpose_to_kx(t1, t2);
+      zfft.exec(T2.p, -1);
+      g_timer.tic(tm_p_lu);
+      solve_columns();
+      g_timer.toc(tm_p_lu);
+      zfft.exec(T2.p, +1);
+      transpose_to_z(t2, t1);
+    }
     g_timer.tic(tm_p_grad);
     halo(t1, nkx_, hbB.p);
     const cplx* hP = hbB.p;
@@ -1538,8 +1766,9 @@ class Solver {
     });
     (void)nkx_; (void)ny_;
   }
+  // columns c0 <= col < c1; T2 as (j, i, k) (kmaj = false) or (i, j, k) (kmaj = true, pipelined step)
   template <int KK>
-  void solve_impl() {
+  void solve_impl(idx c0, idx c1, bool kmaj) {
     const int nkx_ = nkl, nz_ = nzg, ny_ = ny, ntz_ = ntz, kx0_ = kx0;
     const idx nc = ncols;
     const real *su = d_su.p, *sl = d_sl.p;
@@ -1547,26 +1776,28 @@ class Solver {
     real* sy = d_sy.p;
     cplx* t2 = T2.p;
     const real inz = real(1.0 / nzg);
-    pfor_lines(nc, [=] HD(idx col) {
+    pfor_lines(c1 - c0, [=] HD(idx cl) {
+      const idx col = c0 + cl;
       const int t = int(col % ntz_), i = int(col / ntz_);
       const int t2i = (nz_ - t) % nz_;
       const bool paired = (t != 0) && (2 * t != nz_);
+      auto base = [=](int j) -> idx { return kmaj ? (idx(i) * ny_ + j) * nz_ : (idx(j) * nkx_ + i) * nz_; };
       if (i + kx0_ == 0 && (t == 0 || 2 * t == nz_)) {
-        for (int j = 0; j < ny_; ++j) t2[(idx(j) * nkx_ + i) * nz_ + t] = cplx(0, 0);
+        for (int j = 0; j < ny_; ++j) t2[base(j) + t] = cplx(0, 0);
         return;
       }
       band_solve_factored<KK, KK>(
           2 * ny_,
           [=](int r, int c) -> real {
             if (r % 2 == 0) return real(0);
-            const idx b = (idx(r / 2) * nkx_ + i) * nz_;
+            const idx b = base(r / 2);
             if (c < 2) return c == 0 ? t2[b + t].re : t2[b + t].im;
             if (!paired) return real(0);
             return c == 2 ? t2[b + t2i].re : t2[b + t2i].im;
           },
           [=](int r, int c, real val) {
             if (r % 2) return;
-            const idx b = (idx(r / 2) * nkx_ + i) * nz_;
+            const idx b = base(r / 2);
             val *= inz;
             if (c == 0) t2[b + t].re = val;
             else if (c == 1) t2[b + t].im = val;
@@ -1594,16 +1825,17 @@ class Solver {
     }
     factored = true;
   }
-  void solve_columns() {
+  void solve_columns(idx c0 = 0, idx c1 = -1, bool kmaj = false) {
+    if (c1 < 0) c1 = ncols;
     if (!factored) factor_columns();
     switch (K) {
-      case 4: solve_impl<4>(); break;
-      case 6: solve_impl<6>(); break;
-      case 8: solve_impl<8>(); break;
-      case 10: solve_impl<10>(); break;
-      case 12: solve_impl<12>(); break;
-      case 14: solve_impl<14>(); break;
-      case 16: solve_impl<16>(); break;
+      case 4: solve_impl<4>(c0, c1, kmaj); break;
+      case 6: solve_impl<6>(c0, c1, kmaj); break;
+      case 8: solve_impl<8>(c0, c1, kmaj); break;
+      case 10: solve_impl<10>(c0, c1, kmaj); break;
+      case 12: solve_impl<12>(c0, c1, kmaj); break;
+      case 14: solve_impl<14>(c0, c1, kmaj); break;
+      case 16: solve_impl<16>(c0, c1, kmaj); break;
       default: fatal("unsupported band width");
     }
   }
