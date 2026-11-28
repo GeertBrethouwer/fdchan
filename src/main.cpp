@@ -81,6 +81,12 @@ static void read_restart(Solver& S, const std::string& file) {
   MPI_File_read_at_all(fh, 16, d, 3, MPI_DOUBLE, MPI_STATUS_IGNORE);
   if (hdr[0] != S.nx || hdr[1] != S.ny || hdr[2] != S.nzg || hdr[3] != int(sizeof(real)))
     fatal("restart file does not match the grid or the precision");
+  if (std::abs(d[0] - S.P.lx) > 1e-10 * S.P.lx || std::abs(d[1] - S.P.lz) > 1e-10 * S.P.lz) {
+    char m[256];
+    std::snprintf(m, sizeof(m), "restart file has another box (lx = %.10g, lz = %.10g) than the input (lx = %.10g, lz = %.10g)",
+                  d[0], d[1], S.P.lx, S.P.lz);
+    fatal(m);
+  }
   {
     MPI_Offset sz;
     MPI_File_get_size(fh, &sz);
@@ -105,6 +111,12 @@ static void read_restart(Solver& S, const std::string& file) {
   if (std::fread(hdr, sizeof(int), 4, f) != 4 || std::fread(d, sizeof(double), 3, f) != 3) fatal("restart header");
   if (hdr[0] != S.nx || hdr[1] != S.ny || hdr[2] != S.nzg || hdr[3] != int(sizeof(real)))
     fatal("restart file does not match the grid or the precision");
+  if (std::abs(d[0] - S.P.lx) > 1e-10 * S.P.lx || std::abs(d[1] - S.P.lz) > 1e-10 * S.P.lz) {
+    char m[256];
+    std::snprintf(m, sizeof(m), "restart file has another box (lx = %.10g, lz = %.10g) than the input (lx = %.10g, lz = %.10g)",
+                  d[0], d[1], S.P.lx, S.P.lz);
+    fatal(m);
+  }
   std::fseek(f, 0, SEEK_END);
   fsize = std::ftell(f);
   std::fseek(f, 40, SEEK_SET);
