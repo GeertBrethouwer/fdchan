@@ -27,7 +27,9 @@
 #include <chrono>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <random>
+#include <utility>
 #include <string>
 #include <vector>
 
